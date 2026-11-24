@@ -1,0 +1,30 @@
+# systemd unit: attach a remote USB security key from boot (Linux client).
+#
+# 1. Install the binary:   install -m755 usbwire-client /usr/local/bin/
+# 2. Pair as root, into the state directory this unit uses:
+#      usbwire-client pair --state /var/lib/usbwire-client --server HOST:7443 --code XXXXX-XXXXX
+# 3. Edit HOST and the device below, then:
+#      cp usbwire-client.service /etc/systemd/system/
+#      systemctl daemon-reload && systemctl enable --now usbwire-client
+#
+# Needs the usbip tool (package usbip / linux-tools) and the vhci-hcd module.
+# The client reconnects by itself, so it does not matter if the network or
+# the server is not up yet when it starts.
+
+[Unit]
+Description=usbwire client (remote USB security key)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStartPre=/sbin/modprobe vhci-hcd
+ExecStart=/usr/local/bin/usbwire-client serve --server HOST:7443 --dev 1050:0407 --attach --state /var/lib/usbwire-client
+# SIGTERM closes the connection cleanly; the server frees the device at once.
+KillSignal=SIGTERM
+# Exits only on errors retrying cannot fix (not paired, revoked, device
+# changed, another session took over); try again later rather than spin.
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

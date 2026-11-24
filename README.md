@@ -212,6 +212,34 @@ Stop with Ctrl-C: the client closes the connection cleanly, and the server
 gives the device back to its own drivers a few seconds later. If the client
 is killed instead, the server notices after its 10 s idle timeout.
 
+### 4. Keep the key attached in the background
+
+**Windows:** install the client as a service, in an Administrator console,
+after pairing:
+
+```bat
+usbwire-client service install --server SERVER_HOST:7443 --dev 1050:0407
+```
+
+The service starts with Windows (LocalSystem, as usbip-win2 needs to
+attach) and runs `serve --attach` with reconnect. It uses the state folder
+you paired from (`%APPDATA%\usbwire` unless `--state` says otherwise) and
+logs to `client.log` there. `install` refuses if that folder is not paired
+with the server. `sc stop usbwire-client` detaches the key cleanly;
+`usbwire-client service uninstall` removes the service.
+
+**Linux:** use the systemd unit in
+[`contrib/usbwire-client.service`](contrib/usbwire-client.service). Pair as
+root into the state directory it uses, edit the server and device, then
+`systemctl enable --now usbwire-client`:
+
+```sh
+sudo usbwire-client pair --state /var/lib/usbwire-client --server SERVER_HOST:7443 --code XXXXX-XXXXX
+```
+
+The unit loads `vhci-hcd` first. It exits only on errors that retrying
+cannot fix, and systemd then tries again after 30 s.
+
 ## Commands
 
 ### `usbwire-server`
@@ -236,6 +264,8 @@ usbwire-client pair  --server HOST:PORT --code CODE
 usbwire-client list  --server HOST:PORT
 usbwire-client serve --server HOST:PORT --dev VID:PID [--listen ADDR] [--attach] [--no-reconnect]
 usbwire-client bench --server HOST:PORT --dev VID:PID [-n 200]
+usbwire-client service install <serve options>       (Windows, as Administrator)
+usbwire-client service uninstall
 options: --state DIR  --cert FILE
          --no-early-ack  --no-push  --no-desc-cache   (turn off one optimisation, for comparison)
 ```
@@ -302,7 +332,6 @@ was tested.
 
 ## Roadmap
 
-- Run the Windows client in the background (tray app or service)
 - Tray app for the server (status, pairing code)
 - End open sessions when a client is revoked
 - Report errors on early-acked OUT transfers back to the host

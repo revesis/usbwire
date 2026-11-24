@@ -1277,6 +1277,7 @@ dependencies = [
  "tracing-subscriber",
  "usbwire-net",
  "usbwire-proto",
+ "windows-service",
 ]
 
 [[package]]

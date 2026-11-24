@@ -11,11 +11,16 @@
 //!   usbwire-client bench --server HOST:PORT --dev VID:PID [-n 200]
 //!       plays the part of vhci against the local adapter and times FIDO round trips
 //!
+//!   usbwire-client service install <serve options>     (Windows, as Administrator)
+//!       run serve --attach as a service from boot; `service uninstall` removes it
+//!
 //! The client's identity and the certificates of paired servers live in
 //! --state (default: ~/.config/usbwire, %APPDATA%\usbwire on Windows).
 
 mod link;
 mod remote;
+#[cfg(windows)]
+mod service;
 mod usbip;
 
 use std::path::PathBuf;
@@ -48,7 +53,7 @@ struct Args {
     reconnect: bool,
 }
 
-const USAGE: &str = "usage: usbwire-client <pair|list|serve|bench> --server HOST:PORT [--code CODE] [--dev VID:PID] \
+const USAGE: &str = "usage: usbwire-client <pair|list|serve|bench|service install|service uninstall> --server HOST:PORT [--code CODE] [--dev VID:PID] \
 [--listen ADDR] [--attach] [--no-reconnect] [-n N] [--state DIR] [--cert FILE] [--no-early-ack] [--no-push] [--no-desc-cache]";
 
 fn default_state() -> PathBuf {
@@ -70,8 +75,8 @@ fn server_cert_path(state: &std::path::Path, server: &str) -> PathBuf {
     state.join("servers").join(format!("{safe}.der"))
 }
 
-fn parse_args() -> Result<Args> {
-    let mut it = std::env::args().skip(1);
+fn parse_args(raw: Vec<String>) -> Result<Args> {
+    let mut it = raw.into_iter();
     let mut a = Args {
         cmd: it.next().context(USAGE)?,
         server: String::new(),
@@ -113,14 +118,34 @@ fn parse_args() -> Result<Args> {
     Ok(a)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.first().map(String::as_str) == Some("service") {
+        #[cfg(windows)]
+        return service::main(&raw[1..]);
+        #[cfg(not(windows))]
+        bail!("`service` is for Windows; on Linux, run serve from systemd (see contrib/usbwire-client.service)");
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
-    let args = parse_args()?;
+    let args = parse_args(raw)?;
+    tokio::runtime::Runtime::new()?.block_on(async {
+        // Ctrl-C and friends, as a flag every wait in serve can watch.
+        let (stop_tx, stop_rx) = watch::channel(false);
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            let _ = stop_tx.send(true);
+        });
+        run(args, stop_rx).await
+    })
+}
+
+/// Run one command. `stop` turns true when the client should shut down
+/// (Ctrl-C, or the service manager).
+async fn run(args: Args, stop: watch::Receiver<bool>) -> Result<()> {
     let identity = usbwire_net::load_or_create_identity(&args.state)?;
 
     if args.cmd == "pair" {
@@ -148,7 +173,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("not paired with {} (no {}): run `usbwire-client pair` first", args.server, cert_path.display()))?;
     let target = link::Target { server: args.server.clone(), cert: server_cert, identity, caps: args.caps, want: args.dev };
     match args.cmd.as_str() {
-        "serve" => serve(&args, target).await,
+        "serve" => serve(&args, target, stop).await,
         "list" => {
             let remote = target.connect().await?;
             let result = list(&remote).await;
@@ -187,14 +212,7 @@ async fn list(remote: &Remote) -> Result<()> {
 
 /// Serve the device to the OS's USB/IP client until shut down, reconnecting
 /// to the server underneath as needed.
-async fn serve(args: &Args, target: link::Target) -> Result<()> {
-    // Ctrl-C and friends, as a flag every wait below can watch.
-    let (stop_tx, mut stop_rx) = watch::channel(false);
-    tokio::spawn(async move {
-        shutdown_signal().await;
-        let _ = stop_tx.send(true);
-    });
-
+async fn serve(args: &Args, target: link::Target, mut stop_rx: watch::Receiver<bool>) -> Result<()> {
     // We tell usbip the port ourselves with --attach, so any free one
     // will do (3240 is often taken, e.g. by usbipd-win on Windows).
     let default = if args.auto_attach { "127.0.0.1:0" } else { "127.0.0.1:3240" };
