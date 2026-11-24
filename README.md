@@ -55,6 +55,37 @@ Measured with a YubiKey 5 at an added 100 ms RTT:
 With no added delay, the Windows client is as fast as the key plugged in
 directly: CTAPHID_INIT p50 4.00 ms both ways, 1 KB PING 72 ms both ways.
 
+## Surviving connection loss
+
+`usbwire-client serve` keeps the device attached to the OS while the
+connection to the server comes and goes. Applications keep their handles
+(`/dev/hidrawN`, Windows HID handles); the OS never sees an unplug.
+
+- **Outages shorter than 10 s** are ridden out by QUIC: it retransmits, and
+  nothing is lost. A request made during the outage completes once the
+  link is back.
+- **Longer outages, laptop sleep, server restarts:** the client notices
+  within 10 s and reconnects, retrying every few seconds. It attaches the
+  same device again (same VID:PID and serial number) and checks that its
+  descriptors are unchanged, then resumes.
+  - Interrupt IN reads simply keep waiting, like a device with nothing to say.
+  - Transfers the server had when the link died fail with `EPROTO`. Nobody
+    can know whether the device saw them, and replaying them could run a
+    FIDO operation twice, so the application retries instead.
+  - Transfers made while there is no connection are held, and sent after
+    the reconnect.
+- **When it stops retrying:** if the server refuses for good (not paired,
+  revoked, version mismatch), if the device on the server has changed, or
+  if another session of the same client took the device. Without that last
+  check, two copies of one client would take it from each other forever.
+
+`--no-reconnect` restores the old behaviour: exit when the connection drops.
+
+Measured: after a server restart, the Linux client resumed in 3.9 s and the
+Windows client in 2.9 s. After a 45 s network outage, the client
+reconnected 4.9 s after the network returned. In both cases the OS kept the
+same device, with no unplug.
+
 ## Security
 
 - **Identities.** Each server and client creates a self-signed certificate on
@@ -179,7 +210,7 @@ goes away when the client stops.
 
 Stop with Ctrl-C: the client closes the connection cleanly, and the server
 gives the device back to its own drivers a few seconds later. If the client
-is killed instead, the server notices after its 30 s idle timeout.
+is killed instead, the server notices after its 10 s idle timeout.
 
 ## Commands
 
@@ -203,7 +234,7 @@ when a client is revoked stay up until they disconnect.
 ```
 usbwire-client pair  --server HOST:PORT --code CODE
 usbwire-client list  --server HOST:PORT
-usbwire-client serve --server HOST:PORT --dev VID:PID [--listen ADDR] [--attach]
+usbwire-client serve --server HOST:PORT --dev VID:PID [--listen ADDR] [--attach] [--no-reconnect]
 usbwire-client bench --server HOST:PORT --dev VID:PID [-n 200]
 options: --state DIR  --cert FILE
          --no-early-ack  --no-push  --no-desc-cache   (turn off one optimisation, for comparison)
@@ -254,6 +285,7 @@ server). `ONE_WAY_MS` adds that much delay in each direction through
 SERVER=host:7443 scripts/realbench.sh ONE_WAY_MS     # times fido2-token -I
 SERVER=host:7443 scripts/touchtest.sh [ONE_WAY_MS]   # U2F register + sign; needs two touches
 fidoping                                             # INIT + 1 KB PING on the attached key
+SERVER=host:7443 scripts/outage.sh DOWN_SECONDS      # cut the network; the key must survive
 ```
 
 Windows client, in an Administrator console, from the folder with the
@@ -270,7 +302,6 @@ was tested.
 
 ## Roadmap
 
-- Reconnect automatically after a network drop
 - Run the Windows client in the background (tray app or service)
 - Tray app for the server (status, pairing code)
 - End open sessions when a client is revoked

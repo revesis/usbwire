@@ -49,5 +49,6 @@ try {
 finally {
     Stop-Process -Id $p.Id -ErrorAction SilentlyContinue
     if ($ud) { Stop-Process -Id $ud.Id -ErrorAction SilentlyContinue }
-    Get-Content $log -ErrorAction SilentlyContinue | ForEach-Object { $_ -replace '\x1b\[[0-9;]*m', '' } | Select-String 'WARN|ERROR'
+    # The client logs to stdout; errors from main go to stderr.
+    Get-Content $log, "$log.out" -ErrorAction SilentlyContinue | ForEach-Object { $_ -replace '\x1b\[[0-9;]*m', '' } | Select-String 'WARN|ERROR'
 }

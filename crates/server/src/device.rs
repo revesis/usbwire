@@ -121,7 +121,7 @@ impl Registry {
                     }
                     Some(h) if h.fingerprint == fingerprint => {
                         info!("closing this client's previous session to take over the device");
-                        h.conn.close(0u32.into(), b"superseded by a new session");
+                        h.conn.close(usbwire_net::CLOSE_SUPERSEDED.into(), b"superseded by a new session");
                     }
                     Some(_) => return Err(refuse(ErrorCode::Busy, "device is in use by another client")),
                 }

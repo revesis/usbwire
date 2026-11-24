@@ -4,6 +4,8 @@
 //!   usbwire-client list  --server HOST:PORT
 //!   usbwire-client serve --server HOST:PORT --dev VID:PID [--listen 127.0.0.1:3240] [--attach]
 //!       (with --attach and no --listen the adapter takes any free local port)
+//!       If the connection to the server drops, serve reconnects and resumes
+//!       without the OS seeing the device unplugged (--no-reconnect: exit).
 //!       then: usbip attach -r 127.0.0.1 -b 1-1 (Linux, or usbip-win2 usbip.exe on Windows);
 //!       --attach runs that for you
 //!   usbwire-client bench --server HOST:PORT --dev VID:PID [-n 200]
@@ -12,17 +14,18 @@
 //! The client's identity and the certificates of paired servers live in
 //! --state (default: ~/.config/usbwire, %APPDATA%\usbwire on Windows).
 
+mod link;
 mod remote;
 mod usbip;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use usbwire_proto::{AttachOk, Capabilities, DeviceInfo, XferType};
+use tokio::sync::watch;
+use usbwire_proto::{AttachOk, Capabilities, XferType};
 
 use crate::remote::Remote;
 use crate::usbip::Adapter;
@@ -41,10 +44,12 @@ struct Args {
     caps: Capabilities,
     /// serve: run `usbip attach` against our own adapter once it listens.
     auto_attach: bool,
+    /// serve: reconnect when the connection to the server drops.
+    reconnect: bool,
 }
 
 const USAGE: &str = "usage: usbwire-client <pair|list|serve|bench> --server HOST:PORT [--code CODE] [--dev VID:PID] \
-[--listen ADDR] [--attach] [-n N] [--state DIR] [--cert FILE] [--no-early-ack] [--no-push] [--no-desc-cache]";
+[--listen ADDR] [--attach] [--no-reconnect] [-n N] [--state DIR] [--cert FILE] [--no-early-ack] [--no-push] [--no-desc-cache]";
 
 fn default_state() -> PathBuf {
     if let Ok(d) = std::env::var("USBWIRE_CLIENT_STATE") {
@@ -78,6 +83,7 @@ fn parse_args() -> Result<Args> {
         rounds: 200,
         caps: Capabilities { interrupt_in_push: true, early_out_ack: true, descriptor_cache: true },
         auto_attach: false,
+        reconnect: true,
     };
     while let Some(arg) = it.next() {
         let mut val = || it.next().with_context(|| format!("{arg} needs a value"));
@@ -89,6 +95,7 @@ fn parse_args() -> Result<Args> {
             "--listen" => a.listen = Some(val()?),
             "-n" => a.rounds = val()?.parse()?,
             "--attach" => a.auto_attach = true,
+            "--no-reconnect" => a.reconnect = false,
             "--no-early-ack" => a.caps.early_out_ack = false,
             "--no-push" => a.caps.interrupt_in_push = false,
             "--no-desc-cache" => a.caps.descriptor_cache = false,
@@ -139,61 +146,82 @@ async fn main() -> Result<()> {
     let server_cert = std::fs::read(&cert_path)
         .map(usbwire_net::quinn::rustls::pki_types::CertificateDer::from)
         .with_context(|| format!("not paired with {} (no {}): run `usbwire-client pair` first", args.server, cert_path.display()))?;
-    let remote = Arc::new(Remote::connect(&args.server, server_cert, identity, args.caps).await?);
-
-    let result = run(&args, &remote).await;
-    remote.close().await;
-    result
-}
-
-async fn run(args: &Args, remote: &Arc<Remote>) -> Result<()> {
+    let target = link::Target { server: args.server.clone(), cert: server_cert, identity, caps: args.caps, want: args.dev };
     match args.cmd.as_str() {
+        "serve" => serve(&args, target).await,
         "list" => {
-            for d in remote.list().await? {
-                println!(
-                    "dev {}  {:04x}:{:04x}  {:?}  {} {}{}",
-                    d.dev,
-                    d.vid,
-                    d.pid,
-                    d.speed,
-                    d.manufacturer.as_deref().unwrap_or(""),
-                    d.product.as_deref().unwrap_or(""),
-                    if d.busy { "  (in use)" } else { "" }
-                );
-            }
-            Ok(())
-        }
-        "serve" => {
-            // We tell usbip the port ourselves with --attach, so any free one
-            // will do (3240 is often taken, e.g. by usbipd-win on Windows).
-            let default = if args.auto_attach { "127.0.0.1:0" } else { "127.0.0.1:3240" };
-            let addr = args.listen.as_deref().unwrap_or(default);
-            // Bind first: failing here must not cost the server a driver swap.
-            let listener = TcpListener::bind(addr).await.with_context(|| format!("listening on {addr}"))?;
-            let attach = attach(remote, args.dev).await?;
-            if args.auto_attach {
-                let port = listener.local_addr()?.port();
-                tokio::spawn(async move {
-                    if let Err(e) = usbip_attach(port).await {
-                        tracing::error!("usbip attach: {e:#}");
-                    }
-                });
-            }
-            tokio::select! {
-                r = Adapter::new(remote.clone(), attach).serve(listener) => r,
-                _ = shutdown_signal() => Ok(()),
-            }
+            let remote = target.connect().await?;
+            let result = list(&remote).await;
+            remote.close().await;
+            result
         }
         "bench" => {
-            let attach = attach(remote, args.dev).await?;
+            let (remote, attach) = link::connect_attach(&target, None).await?;
             let listener = TcpListener::bind("127.0.0.1:0").await?;
             let addr = listener.local_addr()?;
-            let adapter = Adapter::new(remote.clone(), attach.clone());
-            tokio::spawn(adapter.serve(listener));
-            bench(remote, &attach, addr, args.rounds).await
+            let (_link_tx, link_rx) = watch::channel(Some(link::Link { remote: remote.clone(), dev: attach.info.dev, generation: 1 }));
+            tokio::spawn(Adapter::new(attach.clone(), link_rx).serve(listener));
+            let result = bench(&remote, &attach, addr, args.rounds).await;
+            remote.close().await;
+            result
         }
         _ => bail!("{USAGE}"),
     }
+}
+
+async fn list(remote: &Remote) -> Result<()> {
+    for d in remote.list().await? {
+        println!(
+            "dev {}  {:04x}:{:04x}  {:?}  {} {}{}",
+            d.dev,
+            d.vid,
+            d.pid,
+            d.speed,
+            d.manufacturer.as_deref().unwrap_or(""),
+            d.product.as_deref().unwrap_or(""),
+            if d.busy { "  (in use)" } else { "" }
+        );
+    }
+    Ok(())
+}
+
+/// Serve the device to the OS's USB/IP client until shut down, reconnecting
+/// to the server underneath as needed.
+async fn serve(args: &Args, target: link::Target) -> Result<()> {
+    // Ctrl-C and friends, as a flag every wait below can watch.
+    let (stop_tx, mut stop_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = stop_tx.send(true);
+    });
+
+    // We tell usbip the port ourselves with --attach, so any free one
+    // will do (3240 is often taken, e.g. by usbipd-win on Windows).
+    let default = if args.auto_attach { "127.0.0.1:0" } else { "127.0.0.1:3240" };
+    let addr = args.listen.as_deref().unwrap_or(default);
+    // Bind first: failing here must not cost the server a driver swap.
+    let listener = TcpListener::bind(addr).await.with_context(|| format!("listening on {addr}"))?;
+    let port = listener.local_addr()?.port();
+
+    let first = if args.reconnect {
+        link::connect_attach_retrying(&target, None, &mut stop_rx).await?
+    } else {
+        Some(link::connect_attach(&target, None).await?)
+    };
+    let Some((remote, attach)) = first else { return Ok(()) };
+
+    let (link_tx, link_rx) = watch::channel(Some(link::Link { remote, dev: attach.info.dev, generation: 1 }));
+    let served = tokio::spawn(Adapter::new(attach.clone(), link_rx).serve(listener));
+    if args.auto_attach {
+        tokio::spawn(async move {
+            if let Err(e) = usbip_attach(port).await {
+                tracing::error!("usbip attach: {e:#}");
+            }
+        });
+    }
+    let result = link::supervise(&target, &attach, link_tx, args.reconnect, stop_rx).await;
+    served.abort();
+    result
 }
 
 /// The OS's USB/IP tool: usbip-win2's usbip.exe on Windows, usbip on Linux.
@@ -254,28 +282,6 @@ async fn shutdown_signal() {
             _ = shutdown.recv() => {}
         }
     }
-}
-
-async fn attach(remote: &Remote, want: Option<(u16, u16)>) -> Result<AttachOk> {
-    let list = remote.list().await?;
-    let pick: &DeviceInfo = match want {
-        Some((vid, pid)) => list.iter().find(|d| d.vid == vid && d.pid == pid),
-        None if list.len() == 1 => list.first(),
-        None => bail!("several devices exported; choose one with --dev"),
-    }
-    .context("device not exported by the server")?;
-    let a = remote.attach(pick.dev).await?;
-    tracing::info!(
-        "attached {:04x}:{:04x} {:?}: {} endpoints, snapshot of {} configs / {} strings / {} HID reports",
-        a.info.vid,
-        a.info.pid,
-        a.info.product,
-        a.endpoints.len(),
-        a.descriptors.configs.len(),
-        a.descriptors.strings.len(),
-        a.descriptors.hid_reports.len()
-    );
-    Ok(a)
 }
 
 // ---------------------------------------------------------------------------

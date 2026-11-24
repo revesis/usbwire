@@ -22,6 +22,15 @@ pub const SERVER_NAME: &str = "usbwire";
 pub const ALPN: &[u8] = b"usbwire/1";
 pub const DEFAULT_PORT: u16 = 7443;
 
+/// QUIC application close code: an ordinary hang-up (client exit, server
+/// shutdown). A client may reconnect.
+pub const CLOSE_NORMAL: u32 = 0;
+/// QUIC application close code: the server closed this session because a
+/// newer session of the same client took over its device. The client must
+/// not reconnect, or two copies of it would take the device from each other
+/// forever.
+pub const CLOSE_SUPERSEDED: u32 = 2;
+
 /// Reads whole frames from a QUIC receive stream.
 pub struct FrameReader {
     recv: RecvStream,
@@ -60,8 +69,13 @@ pub async fn send<T: Serialize>(s: &mut SendStream, msg: &T) -> Result<()> {
 fn transport() -> Arc<quinn::TransportConfig> {
     let mut t = quinn::TransportConfig::default();
     // Keep NAT bindings alive and notice dead peers quickly.
-    t.keep_alive_interval(Some(Duration::from_secs(5)));
-    t.max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
+    // An outage shorter than the idle timeout is ridden out by QUIC itself
+    // (it retransmits; nothing is lost). A longer one ends the connection and
+    // the client reconnects, failing what was in flight. 10 s keeps that
+    // blind window short, and lets the server free a vanished client's
+    // device quickly; keep-alives every 2 s keep a quiet link from idling out.
+    t.keep_alive_interval(Some(Duration::from_secs(2)));
+    t.max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()));
     // Plenty of endpoint streams (a few per device).
     t.max_concurrent_bidi_streams(256u32.into());
     Arc::new(t)

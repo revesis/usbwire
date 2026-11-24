@@ -11,11 +11,12 @@ use std::sync::{Arc, Mutex as StdMutex};
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use tracing::{debug, info, warn};
 use usbwire_proto::{AttachOk, Capabilities, Speed, Status, Submit, UrbId, XferType};
 
-use crate::remote::{EpEvent, Remote};
+use crate::link::Link;
+use crate::remote::{EpEvent, EpStreams};
 
 pub const USBIP_VERSION: u16 = 0x0111;
 const OP_REQ_DEVLIST: u16 = 0x8005;
@@ -121,12 +122,13 @@ fn be32(b: &[u8], off: usize) -> u32 {
     u32::from_be_bytes(b[off..off + 4].try_into().unwrap())
 }
 
-/// Shared state of one attached session.
+/// Shared state of one attached device.
 pub struct Adapter {
-    pub remote: Arc<Remote>,
     pub attach: AttachOk,
     /// Features in effect (asked for by us, granted by the server).
     caps: Capabilities,
+    /// The current connection to the server; None while reconnecting.
+    link: watch::Receiver<Option<Link>>,
     /// Events from all endpoint streams. Locked for the duration of one import.
     done_rx: Mutex<mpsc::UnboundedReceiver<EpEvent>>,
     done_tx: mpsc::UnboundedSender<EpEvent>,
@@ -137,6 +139,8 @@ struct Inflight {
     ep: u8,
     is_in: bool,
     unlink_seq: Option<u32>,
+    /// Sent on the current connection. Unsent URBs wait in `Session::held`.
+    sent: bool,
 }
 
 /// Client side of a push endpoint: vhci's IN URBs on one side, reports the
@@ -156,11 +160,72 @@ struct PushEp {
 /// Bound on buffered reports per endpoint; the oldest is dropped beyond it.
 const PUSH_BUFFER: usize = 64;
 
+/// A transfer whose fate is unknown because the connection dropped while the
+/// server had it: we cannot tell whether the device saw it, so fail it.
+const EPROTO: i32 = -71;
+
 #[derive(Default)]
 struct Session {
     inflight: HashMap<u32, Inflight>,
     push: HashMap<u8, PushEp>,
+    /// Submissions made while there was no connection, sent on reconnect.
+    held: VecDeque<(u8, Submit)>,
 }
+
+impl Session {
+    /// The connection is gone. Fail what the server had (USB/IP replies for
+    /// the OS) and forget server-side polling; pending push URBs simply keep
+    /// waiting, as they would on a device with nothing to say.
+    fn link_down(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.inflight.retain(|&seq, f| {
+            if !f.sent {
+                return true;
+            }
+            match f.unlink_seq {
+                Some(useq) => out.extend(ret_unlink(useq, ECONNRESET)),
+                None => out.extend(ret_submit(seq, EPROTO, &[], f.is_in, 0)),
+            }
+            false
+        });
+        for pe in self.push.values_mut() {
+            pe.epoch = None;
+        }
+        out
+    }
+
+    /// A new connection is up: push endpoints whose URBs are waiting must
+    /// start polling again; held submissions go out.
+    fn link_up(&mut self) -> Resume {
+        let mut restart = Vec::new();
+        for (&ep, pe) in &mut self.push {
+            if pe.epoch.is_none()
+                && let Some(&(seq, len)) = pe.pending.front()
+            {
+                pe.epoch = Some(seq as UrbId);
+                restart.push((ep, seq, len));
+            }
+        }
+        Resume { restart, held: self.held.drain(..).collect() }
+    }
+}
+
+/// What to send on a new connection.
+struct Resume {
+    /// Push endpoints to start polling: (ep, epoch, transfer length).
+    restart: Vec<(u8, u32, u32)>,
+    /// Submissions held while there was no connection, in order.
+    held: Vec<(u8, Submit)>,
+}
+
+/// One USB/IP command from the OS.
+enum Cmd {
+    Submit { seq: u32, ep: u8, is_in: bool, len: u32, setup: Option<[u8; 8]>, data: Vec<u8> },
+    Unlink { seq: u32, target: u32 },
+}
+
+/// Endpoint streams on the current connection, tagged with its generation.
+type Current = Option<(u64, EpStreams)>;
 
 /// RET_SUBMIT for an IN URB of `len` bytes completed with `data`.
 fn ret_in(seq: u32, len: u32, mut data: Vec<u8>) -> Vec<u8> {
@@ -173,11 +238,11 @@ fn ret_in(seq: u32, len: u32, mut data: Vec<u8>) -> Vec<u8> {
 }
 
 impl Adapter {
-    pub fn new(remote: Arc<Remote>, attach: AttachOk) -> Arc<Self> {
+    pub fn new(attach: AttachOk, link: watch::Receiver<Option<Link>>) -> Arc<Self> {
         let (done_tx, done_rx) = mpsc::unbounded_channel();
         let caps = attach.caps;
         info!(?caps, "features");
-        Arc::new(Adapter { remote, attach, caps, done_rx: Mutex::new(done_rx), done_tx })
+        Arc::new(Adapter { attach, caps, link, done_rx: Mutex::new(done_rx), done_tx })
     }
 
     fn xfer(&self, ep: u8) -> Option<XferType> {
@@ -320,9 +385,9 @@ impl Adapter {
 
     async fn urb_loop(self: Arc<Self>, sock: TcpStream) -> Result<()> {
         let sess: Arc<StdMutex<Session>> = Default::default();
-        let (mut rd, wr) = sock.into_split();
-        // Replies produced on the reader side: early OUT acks, cached
-        // descriptors, buffered reports, local unlinks.
+        let (rd, wr) = sock.into_split();
+        // Replies produced here rather than by the server: early OUT acks,
+        // cached descriptors, buffered reports, local unlinks, failures.
         let (local_tx, mut local_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
         // Writer: events from the server and locally produced replies.
@@ -355,128 +420,250 @@ impl Adapter {
             anyhow::Ok(())
         });
 
-        let mut eps = self.remote.endpoints(self.attach.info.dev, self.done_tx.clone());
-        let mut hdr = [0u8; HEADER_LEN];
-        let result: Result<()> = async {
-            loop {
-                if let Err(e) = rd.read_exact(&mut hdr).await {
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                        return Ok(());
+        // Reader: the socket is read by its own task, so that the loop below
+        // can also react to the connection changing while the OS is quiet.
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<Cmd>(256);
+        let reader = tokio::spawn(read_cmds(rd, cmd_tx));
+
+        let mut link = self.link.clone();
+        let mut cur: Current = None;
+        let mut link_open = true;
+        let first = link.borrow_and_update().clone();
+        self.switch_link(&mut cur, first, &sess, &local_tx).await;
+        loop {
+            tokio::select! {
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(cmd) => self.on_cmd(cmd, &mut cur, &sess, &local_tx).await,
+                    None => break,
+                },
+                changed = link.changed(), if link_open => match changed {
+                    Ok(()) => {
+                        let l = link.borrow_and_update().clone();
+                        self.switch_link(&mut cur, l, &sess, &local_tx).await;
                     }
-                    return Err(e.into());
+                    Err(_) => link_open = false,
+                },
+            }
+        }
+        drop(cur); // finishes endpoint streams; the server cancels what is pending
+        drop(local_tx);
+        writer.abort();
+        reader.await?
+    }
+
+    /// Move to another connection (or none). Whatever the old connection
+    /// had in flight is failed; waiting work restarts on the new one.
+    async fn switch_link(&self, cur: &mut Current, new: Option<Link>, sess: &StdMutex<Session>, local: &Local) {
+        if cur.as_ref().map(|c| c.0) == new.as_ref().map(|l| l.generation) {
+            return;
+        }
+        if cur.take().is_some() {
+            let replies = sess.lock().unwrap().link_down();
+            if !replies.is_empty() {
+                let _ = local.send(replies);
+            }
+        }
+        let Some(l) = new else { return };
+        *cur = Some((l.generation, l.remote.endpoints(l.dev, self.done_tx.clone())));
+        let Resume { restart, held } = sess.lock().unwrap().link_up();
+        if !restart.is_empty() || !held.is_empty() {
+            info!(restart = restart.len(), held = held.len(), "resuming on the new connection");
+        }
+        for (ep, seq, len) in restart {
+            let s = Submit { urb: seq as UrbId, setup: None, length: len, data: vec![], acked_early: false };
+            if !send_now(cur, ep, s).await
+                && let Some(pe) = sess.lock().unwrap().push.get_mut(&ep)
+            {
+                pe.epoch = None;
+            }
+        }
+        for (ep, s) in held {
+            self.submit_or_hold(cur, sess, ep, s).await;
+        }
+    }
+
+    /// Send a submission now if there is a connection, else keep it for the
+    /// next one.
+    async fn submit_or_hold(&self, cur: &mut Current, sess: &StdMutex<Session>, ep: u8, s: Submit) {
+        let seq = s.urb as u32;
+        if send_now(cur, ep, s.clone()).await {
+            if let Some(f) = sess.lock().unwrap().inflight.get_mut(&seq) {
+                f.sent = true;
+            }
+        } else {
+            let mut ss = sess.lock().unwrap();
+            if let Some(f) = ss.inflight.get_mut(&seq) {
+                f.sent = false;
+            }
+            ss.held.push_back((ep, s));
+        }
+    }
+
+    async fn on_cmd(&self, cmd: Cmd, cur: &mut Current, sess: &StdMutex<Session>, local: &Local) {
+        match cmd {
+            Cmd::Submit { seq, ep, is_in, len, setup, data } => {
+                if let Some(d) = setup.as_ref().and_then(|s| self.cached_descriptor(s)) {
+                    let _ = local.send(ret_submit(seq, 0, &d, true, d.len() as u32));
+                    return;
                 }
-                let cmd = be32(&hdr, 0);
-                let seq = be32(&hdr, 4);
-                let is_in = be32(&hdr, 12) == 1;
-                let epnum = be32(&hdr, 16) as u8;
-                match cmd {
-                    CMD_SUBMIT => {
-                        let len = be32(&hdr, 24);
-                        let npackets = be32(&hdr, 32) as i32;
-                        let mut data = Vec::new();
-                        if !is_in && len > 0 {
-                            data = vec![0; len as usize];
-                            rd.read_exact(&mut data).await?;
-                        }
-                        if npackets > 0 {
-                            bail!("isochronous transfers are not supported");
-                        }
-                        let ep = if epnum == 0 { 0 } else { epnum | if is_in { 0x80 } else { 0 } };
-                        let setup: Option<[u8; 8]> = (ep == 0).then(|| hdr[40..48].try_into().unwrap());
 
-                        if let Some(d) = setup.as_ref().and_then(|s| self.cached_descriptor(s)) {
-                            let _ = local_tx.send(ret_submit(seq, 0, &d, true, d.len() as u32));
-                            continue;
-                        }
-
-                        if self.is_push(ep) {
-                            let start = {
-                                let mut s = sess.lock().unwrap();
-                                let pe = s.push.entry(ep).or_default();
-                                if let Some(st) = pe.deferred.take() {
-                                    let _ = local_tx.send(ret_submit(seq, errno(st), &[], true, 0));
-                                } else if let Some(d) = pe.buffer.pop_front() {
-                                    let _ = local_tx.send(ret_in(seq, len, d));
-                                } else {
-                                    pe.pending.push_back((seq, len));
-                                }
-                                pe.epoch.is_none().then(|| {
-                                    pe.epoch = Some(seq as UrbId);
-                                })
-                            };
-                            if start.is_some() {
-                                let s = Submit { urb: seq as UrbId, setup: None, length: len, data, acked_early: false };
-                                eps.submit(ep, s).await?;
-                            }
-                            continue;
-                        }
-
-                        let acked_early = self.early_ack(ep);
-                        if acked_early {
-                            let _ = local_tx.send(ret_submit(seq, 0, &[], false, len));
+                if self.is_push(ep) {
+                    let start = {
+                        let mut s = sess.lock().unwrap();
+                        let pe = s.push.entry(ep).or_default();
+                        if let Some(st) = pe.deferred.take() {
+                            let _ = local.send(ret_submit(seq, errno(st), &[], true, 0));
+                        } else if let Some(d) = pe.buffer.pop_front() {
+                            let _ = local.send(ret_in(seq, len, d));
                         } else {
-                            sess.lock().unwrap().inflight.insert(seq, Inflight { ep, is_in, unlink_seq: None });
+                            pe.pending.push_back((seq, len));
                         }
-                        let s = Submit { urb: seq as UrbId, setup, length: len, data, acked_early };
-                        eps.submit(ep, s).await?;
-                    }
-                    CMD_UNLINK => {
-                        let target = be32(&hdr, 20);
-                        enum Found {
-                            /// A push URB waiting locally; Some(epoch) if polling should stop.
-                            Push(u8, Option<UrbId>),
-                            Remote(u8),
-                            None,
+                        // Without a connection, polling starts on reconnect (link_up).
+                        let start = pe.epoch.is_none() && cur.is_some();
+                        if start {
+                            pe.epoch = Some(seq as UrbId);
                         }
-                        let found = {
-                            let mut s = sess.lock().unwrap();
-                            let push_hit = s.push.iter_mut().find_map(|(&ep, pe)| {
-                                let i = pe.pending.iter().position(|&(q, _)| q == target)?;
-                                pe.pending.remove(i);
-                                // usbhid unlinks its IN URB when the device is closed:
-                                // stop reading so the device isn't drained while nobody listens.
-                                // Reports already read stay buffered for the next reader.
-                                let stop = if pe.pending.is_empty() {
-                                    pe.epoch.take()
-                                } else {
-                                    None
-                                };
-                                Some(Found::Push(ep, stop))
-                            });
-                            match push_hit {
-                                Some(f) => f,
-                                None => match s.inflight.get_mut(&target) {
-                                    Some(f) => {
-                                        f.unlink_seq = Some(seq);
-                                        Found::Remote(f.ep)
-                                    }
-                                    None => Found::None,
-                                },
-                            }
-                        };
-                        match found {
-                            Found::Push(ep, stop) => {
-                                let _ = local_tx.send(ret_unlink(seq, ECONNRESET));
-                                if let Some(epoch) = stop {
-                                    eps.cancel(ep, epoch).await?;
-                                }
-                            }
-                            Found::Remote(ep) => eps.cancel(ep, target as UrbId).await?,
-                            // Already completed and returned.
-                            Found::None => {
-                                let _ = local_tx.send(ret_unlink(seq, 0));
-                            }
+                        start
+                    };
+                    if start {
+                        let s = Submit { urb: seq as UrbId, setup: None, length: len, data, acked_early: false };
+                        if !send_now(cur, ep, s).await
+                            && let Some(pe) = sess.lock().unwrap().push.get_mut(&ep)
+                        {
+                            pe.epoch = None;
                         }
                     }
-                    other => bail!("unexpected USB/IP command {other}"),
+                    return;
+                }
+
+                let acked_early = self.early_ack(ep);
+                if acked_early {
+                    let _ = local.send(ret_submit(seq, 0, &[], false, len));
+                } else {
+                    sess.lock().unwrap().inflight.insert(seq, Inflight { ep, is_in, unlink_seq: None, sent: false });
+                }
+                let s = Submit { urb: seq as UrbId, setup, length: len, data, acked_early };
+                self.submit_or_hold(cur, sess, ep, s).await;
+            }
+            Cmd::Unlink { seq, target } => {
+                enum Found {
+                    /// A push URB waiting locally; Some(epoch) if polling should stop.
+                    Push(u8, Option<UrbId>),
+                    /// A URB the server has.
+                    Remote(u8),
+                    /// A URB waiting for a connection: dropped here.
+                    Held,
+                    None,
+                }
+                let found = {
+                    let mut guard = sess.lock().unwrap();
+                    let s = &mut *guard;
+                    let push_hit = s.push.iter_mut().find_map(|(&ep, pe)| {
+                        let i = pe.pending.iter().position(|&(q, _)| q == target)?;
+                        pe.pending.remove(i);
+                        // usbhid unlinks its IN URB when the device is closed:
+                        // stop reading so the device isn't drained while nobody listens.
+                        // Reports already read stay buffered for the next reader.
+                        let stop = if pe.pending.is_empty() { pe.epoch.take() } else { None };
+                        Some(Found::Push(ep, stop))
+                    });
+                    match push_hit {
+                        Some(f) => f,
+                        None => match s.inflight.get_mut(&target) {
+                            Some(f) if f.sent => {
+                                f.unlink_seq = Some(seq);
+                                Found::Remote(f.ep)
+                            }
+                            Some(_) => {
+                                s.inflight.remove(&target);
+                                s.held.retain(|(_, h)| h.urb as u32 != target);
+                                Found::Held
+                            }
+                            None => Found::None,
+                        },
+                    }
+                };
+                match found {
+                    Found::Push(ep, stop) => {
+                        let _ = local.send(ret_unlink(seq, ECONNRESET));
+                        if let Some(epoch) = stop
+                            && let Some((_, eps)) = cur
+                        {
+                            let _ = eps.cancel(ep, epoch).await;
+                        }
+                    }
+                    // If the cancel cannot be sent, the connection is going down
+                    // and link_down answers the unlink.
+                    Found::Remote(ep) => {
+                        if let Some((_, eps)) = cur {
+                            let _ = eps.cancel(ep, target as UrbId).await;
+                        }
+                    }
+                    Found::Held => {
+                        let _ = local.send(ret_unlink(seq, ECONNRESET));
+                    }
+                    // Already completed and returned.
+                    Found::None => {
+                        let _ = local.send(ret_unlink(seq, 0));
+                    }
                 }
             }
         }
-        .await;
-        drop(eps); // finishes endpoint streams; the server cancels what is pending
-        drop(local_tx);
-        writer.abort();
-        result
+    }
+}
+
+type Local = mpsc::UnboundedSender<Vec<u8>>;
+
+/// Send on the current connection; false if there is none or it failed.
+async fn send_now(cur: &mut Current, ep: u8, s: Submit) -> bool {
+    match cur {
+        Some((_, eps)) => match eps.submit(ep, s).await {
+            Ok(()) => true,
+            Err(e) => {
+                debug!(ep, "submit failed, holding it for the next connection: {e:#}");
+                false
+            }
+        },
+        None => false,
+    }
+}
+
+/// Parse USB/IP commands from the OS until it disconnects (Ok) or errs.
+async fn read_cmds(mut rd: tokio::net::tcp::OwnedReadHalf, tx: mpsc::Sender<Cmd>) -> Result<()> {
+    let mut hdr = [0u8; HEADER_LEN];
+    loop {
+        if let Err(e) = rd.read_exact(&mut hdr).await {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                return Ok(());
+            }
+            return Err(e.into());
+        }
+        let cmd = be32(&hdr, 0);
+        let seq = be32(&hdr, 4);
+        let is_in = be32(&hdr, 12) == 1;
+        let epnum = be32(&hdr, 16) as u8;
+        let c = match cmd {
+            CMD_SUBMIT => {
+                let len = be32(&hdr, 24);
+                let npackets = be32(&hdr, 32) as i32;
+                let mut data = Vec::new();
+                if !is_in && len > 0 {
+                    data = vec![0; len as usize];
+                    rd.read_exact(&mut data).await?;
+                }
+                if npackets > 0 {
+                    bail!("isochronous transfers are not supported");
+                }
+                let ep = if epnum == 0 { 0 } else { epnum | if is_in { 0x80 } else { 0 } };
+                let setup: Option<[u8; 8]> = (ep == 0).then(|| hdr[40..48].try_into().unwrap());
+                Cmd::Submit { seq, ep, is_in, len, setup, data }
+            }
+            CMD_UNLINK => Cmd::Unlink { seq, target: be32(&hdr, 20) },
+            other => bail!("unexpected USB/IP command {other}"),
+        };
+        if tx.send(c).await.is_err() {
+            return Ok(());
+        }
     }
 }
 
@@ -608,10 +795,45 @@ mod tests {
     #[test]
     fn unlinked_urb_cancelled_by_server() {
         let mut s = Session::default();
-        s.inflight.insert(5, Inflight { ep: 0x02, is_in: false, unlink_seq: Some(6) });
+        s.inflight.insert(5, Inflight { ep: 0x02, is_in: false, unlink_seq: Some(6), sent: true });
         let mut out = Vec::new();
         let c = Complete { urb: 5, status: Status::Cancelled, actual_length: 0, data: vec![] };
         Adapter::on_event(&mut s, EpEvent::Complete(c), &mut out);
         assert_eq!(parse(&out), vec![(RET_UNLINK, 6, ECONNRESET, vec![])]);
     }
+
+    #[test]
+    fn link_down_fails_what_the_server_had_and_keeps_the_rest() {
+        let mut s = push_session(10);
+        s.push.get_mut(&0x84).unwrap().pending.push_back((11, 64));
+        s.inflight.insert(20, Inflight { ep: 0x81, is_in: true, unlink_seq: None, sent: true });
+        s.inflight.insert(21, Inflight { ep: 0x02, is_in: false, unlink_seq: Some(22), sent: true });
+        s.inflight.insert(23, Inflight { ep: 0x02, is_in: false, unlink_seq: None, sent: false });
+        let mut out = parse(&s.link_down());
+        out.sort_by_key(|r| r.1);
+        // Sent and unanswered: fate unknown, failed. Unlink requested: answered.
+        assert_eq!(out, vec![(RET_SUBMIT, 20, EPROTO, vec![]), (RET_UNLINK, 22, ECONNRESET, vec![])]);
+        // Held (never sent) stays for the next connection.
+        assert_eq!(s.inflight.keys().collect::<Vec<_>>(), vec![&23]);
+        // The push URB keeps waiting; the server no longer polls for it.
+        let pe = &s.push[&0x84];
+        assert_eq!((pe.epoch, pe.pending.len()), (None, 1));
+    }
+
+    #[test]
+    fn link_up_restarts_polling_and_releases_held_submissions() {
+        let mut s = push_session(10);
+        s.link_down();
+        s.push.get_mut(&0x84).unwrap().pending.extend([(11, 64), (12, 64)]);
+        s.push.insert(0x83, PushEp::default()); // nobody waiting: stays idle
+        let sub = |urb| Submit { urb, setup: None, length: 0, data: vec![1], acked_early: true };
+        s.held.extend([(0x04, sub(30)), (0x04, sub(31))]);
+        let r = s.link_up();
+        assert_eq!(r.restart, vec![(0x84, 11, 64)]);
+        assert_eq!(r.held.iter().map(|(_, h)| h.urb).collect::<Vec<_>>(), vec![30, 31]);
+        assert_eq!(s.push[&0x84].epoch, Some(11));
+        assert_eq!(s.push[&0x83].epoch, None);
+        assert!(s.held.is_empty());
+    }
+
 }

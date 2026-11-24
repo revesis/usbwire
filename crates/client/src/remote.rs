@@ -12,9 +12,31 @@ use usbwire_net::quinn::rustls::pki_types::CertificateDer;
 use usbwire_net::auth::{self, Pairing, ServerCert};
 use usbwire_net::{FrameReader, quinn, send};
 use usbwire_proto::{
-    AttachOk, Capabilities, Complete, Control, DevId, DeviceInfo, EpMsg, EpOpen, Hello, PROTOCOL_VERSION,
+    AttachOk, Capabilities, Complete, Control, DevId, DeviceInfo, EpMsg, EpOpen, ErrorCode, Hello, PROTOCOL_VERSION,
     Status, Submit, UrbId,
 };
+
+/// The server answered with an error. `fatal` errors will not go away by
+/// retrying (not paired, revoked, incompatible version).
+#[derive(Debug)]
+pub struct ServerRefused {
+    pub code: ErrorCode,
+    pub message: String,
+}
+
+impl std::fmt::Display for ServerRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "server refused ({:?}): {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ServerRefused {}
+
+impl ServerRefused {
+    pub fn fatal(&self) -> bool {
+        matches!(self.code, ErrorCode::NotPaired | ErrorCode::Unauthorized | ErrorCode::VersionMismatch)
+    }
+}
 
 /// Everything the server sends on endpoint streams.
 #[derive(Debug)]
@@ -114,7 +136,7 @@ impl Remote {
             Some(Control::HelloOk { server_name, .. }) => {
                 info!("connected to {server_name} ({server}) in {:?}", t.elapsed())
             }
-            Some(Control::Error { code, message }) => bail!("server refused ({code:?}): {message}"),
+            Some(Control::Error { code, message }) => return Err(ServerRefused { code, message }.into()),
             other => bail!("handshake failed: {other:?}"),
         }
         Ok(Remote { endpoint, conn, ctl: Mutex::new((tx, rx)) })
@@ -124,7 +146,7 @@ impl Remote {
         let mut ctl = self.ctl.lock().await;
         send(&mut ctl.0, &msg).await?;
         match ctl.1.next::<Control>().await? {
-            Some(Control::Error { code, message }) => bail!("server error {code:?}: {message}"),
+            Some(Control::Error { code, message }) => Err(ServerRefused { code, message }.into()),
             Some(reply) => Ok(reply),
             None => bail!("server closed the control stream"),
         }
@@ -144,10 +166,15 @@ impl Remote {
         }
     }
 
+    /// Resolves when the connection is gone, with the reason.
+    pub async fn closed(&self) -> quinn::ConnectionError {
+        self.conn.closed().await
+    }
+
     /// Close the connection so the server releases attached devices at once
     /// instead of after the idle timeout.
     pub async fn close(&self) {
-        self.conn.close(0u32.into(), b"bye");
+        self.conn.close(usbwire_net::CLOSE_NORMAL.into(), b"bye");
         self.endpoint.wait_idle().await;
     }
 
