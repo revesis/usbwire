@@ -1,0 +1,456 @@
+//! usbwire-client
+//!
+//!   usbwire-client pair  --server HOST:PORT --code XXXXX-XXXXX    once per server
+//!   usbwire-client list  --server HOST:PORT
+//!   usbwire-client serve --server HOST:PORT --dev VID:PID [--listen 127.0.0.1:3240]
+//!       then: usbip attach -r 127.0.0.1 -b 1-1   (Linux)  /  usbip.exe attach ... (usbip-win2)
+//!   usbwire-client bench --server HOST:PORT --dev VID:PID [-n 200]
+//!       plays the part of vhci against the local adapter and times FIDO round trips
+//!
+//! The client's identity and the certificates of paired servers live in
+//! --state (default: ~/.config/usbwire, %APPDATA%\usbwire on Windows).
+
+mod remote;
+mod usbip;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use usbwire_proto::{AttachOk, Capabilities, DeviceInfo, XferType};
+
+use crate::remote::Remote;
+use crate::usbip::Adapter;
+
+struct Args {
+    cmd: String,
+    server: String,
+    state: PathBuf,
+    /// Override the stored server certificate (testing).
+    cert: Option<PathBuf>,
+    code: String,
+    dev: Option<(u16, u16)>,
+    listen: String,
+    rounds: usize,
+    caps: Capabilities,
+}
+
+const USAGE: &str = "usage: usbwire-client <pair|list|serve|bench> --server HOST:PORT [--code CODE] [--dev VID:PID] \
+[--listen ADDR] [-n N] [--state DIR] [--cert FILE] [--no-early-ack] [--no-push] [--no-desc-cache]";
+
+fn default_state() -> PathBuf {
+    if let Ok(d) = std::env::var("USBWIRE_CLIENT_STATE") {
+        return d.into();
+    }
+    #[cfg(windows)]
+    let base = std::env::var("APPDATA").map(PathBuf::from).unwrap_or_else(|_| ".".into());
+    #[cfg(not(windows))]
+    let base = std::env::var("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".config")
+    });
+    base.join("usbwire")
+}
+
+/// Where the pinned certificate of `server` is stored.
+fn server_cert_path(state: &std::path::Path, server: &str) -> PathBuf {
+    let safe: String = server.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
+    state.join("servers").join(format!("{safe}.der"))
+}
+
+fn parse_args() -> Result<Args> {
+    let mut it = std::env::args().skip(1);
+    let mut a = Args {
+        cmd: it.next().context(USAGE)?,
+        server: String::new(),
+        state: default_state(),
+        cert: None,
+        code: String::new(),
+        dev: None,
+        listen: "127.0.0.1:3240".into(),
+        rounds: 200,
+        caps: Capabilities { interrupt_in_push: true, early_out_ack: true, descriptor_cache: true },
+    };
+    while let Some(arg) = it.next() {
+        let mut val = || it.next().with_context(|| format!("{arg} needs a value"));
+        match arg.as_str() {
+            "--server" => a.server = val()?,
+            "--cert" => a.cert = Some(val()?.into()),
+            "--state" => a.state = val()?.into(),
+            "--code" => a.code = val()?,
+            "--listen" => a.listen = val()?,
+            "-n" => a.rounds = val()?.parse()?,
+            "--no-early-ack" => a.caps.early_out_ack = false,
+            "--no-push" => a.caps.interrupt_in_push = false,
+            "--no-desc-cache" => a.caps.descriptor_cache = false,
+            "--dev" => {
+                let v = val()?;
+                let (vid, pid) = v.split_once(':').context("--dev wants VID:PID in hex")?;
+                a.dev = Some((u16::from_str_radix(vid, 16)?, u16::from_str_radix(pid, 16)?));
+            }
+            _ => bail!("{USAGE}"),
+        }
+    }
+    if a.server.is_empty() {
+        bail!("{USAGE}");
+    }
+    Ok(a)
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+    let args = parse_args()?;
+    let identity = usbwire_net::load_or_create_identity(&args.state)?;
+
+    if args.cmd == "pair" {
+        if args.code.is_empty() {
+            bail!("pair needs --code (shown by `usbwire-server pair` on the server)");
+        }
+        let my_fp = usbwire_net::auth::fingerprint(&identity.0);
+        let p = remote::pair(&args.server, identity, &args.code).await?;
+        let path = server_cert_path(&args.state, &args.server);
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::write(&path, &p.server_cert)?;
+        println!(
+            "paired with {} ({}); allowed devices: {}",
+            p.server_name,
+            usbwire_net::auth::short_fp(&usbwire_net::auth::fingerprint(&p.server_cert)),
+            p.allowed.join(", ")
+        );
+        println!("this client: {}", usbwire_net::auth::short_fp(&my_fp));
+        return Ok(());
+    }
+
+    let cert_path = args.cert.clone().unwrap_or_else(|| server_cert_path(&args.state, &args.server));
+    let server_cert = std::fs::read(&cert_path)
+        .map(usbwire_net::quinn::rustls::pki_types::CertificateDer::from)
+        .with_context(|| format!("not paired with {} (no {}): run `usbwire-client pair` first", args.server, cert_path.display()))?;
+    let remote = Arc::new(Remote::connect(&args.server, server_cert, identity, args.caps).await?);
+
+    let result = run(&args, &remote).await;
+    remote.close().await;
+    result
+}
+
+async fn run(args: &Args, remote: &Arc<Remote>) -> Result<()> {
+    match args.cmd.as_str() {
+        "list" => {
+            for d in remote.list().await? {
+                println!(
+                    "dev {}  {:04x}:{:04x}  {:?}  {} {}",
+                    d.dev,
+                    d.vid,
+                    d.pid,
+                    d.speed,
+                    d.manufacturer.as_deref().unwrap_or(""),
+                    d.product.as_deref().unwrap_or("")
+                );
+            }
+            Ok(())
+        }
+        "serve" => {
+            let attach = attach(remote, args.dev).await?;
+            let listener = TcpListener::bind(&args.listen).await?;
+            tokio::select! {
+                r = Adapter::new(remote.clone(), attach).serve(listener) => r,
+                _ = shutdown_signal() => Ok(()),
+            }
+        }
+        "bench" => {
+            let attach = attach(remote, args.dev).await?;
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let addr = listener.local_addr()?;
+            let adapter = Adapter::new(remote.clone(), attach.clone());
+            tokio::spawn(adapter.serve(listener));
+            bench(remote, &attach, addr, args.rounds).await
+        }
+        _ => bail!("{USAGE}"),
+    }
+}
+
+/// Ctrl-C, or SIGTERM on Unix: either way we fall through to a clean QUIC
+/// close so the server releases the device immediately.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+async fn attach(remote: &Remote, want: Option<(u16, u16)>) -> Result<AttachOk> {
+    let list = remote.list().await?;
+    let pick: &DeviceInfo = match want {
+        Some((vid, pid)) => list.iter().find(|d| d.vid == vid && d.pid == pid),
+        None if list.len() == 1 => list.first(),
+        None => bail!("several devices exported; choose one with --dev"),
+    }
+    .context("device not exported by the server")?;
+    let a = remote.attach(pick.dev).await?;
+    tracing::info!(
+        "attached {:04x}:{:04x} {:?}: {} endpoints, snapshot of {} configs / {} strings / {} HID reports",
+        a.info.vid,
+        a.info.pid,
+        a.info.product,
+        a.endpoints.len(),
+        a.descriptors.configs.len(),
+        a.descriptors.strings.len(),
+        a.descriptors.hid_reports.len()
+    );
+    Ok(a)
+}
+
+// ---------------------------------------------------------------------------
+// Bench: act like vhci_hcd against the adapter
+// ---------------------------------------------------------------------------
+
+struct Vhci {
+    sock: TcpStream,
+    seq: u32,
+}
+
+impl Vhci {
+    async fn submit(&mut self, ep: u8, is_in: bool, len: u32, setup: [u8; 8], out: &[u8]) -> Result<u32> {
+        self.seq += 1;
+        let mut msg = usbip::cmd_submit(self.seq, ep, is_in, len, setup);
+        msg.extend_from_slice(out);
+        self.sock.write_all(&msg).await?;
+        Ok(self.seq)
+    }
+
+    async fn unlink(&mut self, target: u32) -> Result<u32> {
+        self.seq += 1;
+        self.sock.write_all(&usbip::cmd_unlink(self.seq, target)).await?;
+        Ok(self.seq)
+    }
+
+    /// (command, seqnum, status, data)
+    async fn reply(&mut self, in_len: impl Fn(u32) -> bool) -> Result<(u32, u32, i32, Vec<u8>)> {
+        let mut hdr = [0u8; usbip::HEADER_LEN];
+        tokio::time::timeout(Duration::from_secs(5), self.sock.read_exact(&mut hdr))
+            .await
+            .context("timed out waiting for a USB/IP reply")??;
+        let (cmd, seq, status, actual) = usbip::parse_ret(&hdr);
+        let mut data = Vec::new();
+        if cmd == usbip::RET_SUBMIT && in_len(seq) {
+            data = vec![0; actual as usize];
+            self.sock.read_exact(&mut data).await?;
+        }
+        Ok((cmd, seq, status, data))
+    }
+}
+
+fn stats(name: &str, mut t: Vec<Duration>) {
+    t.sort();
+    let us = |d: Duration| d.as_micros();
+    println!(
+        "{name:<34} n={:<4} min {:>6}us  p50 {:>6}us  p90 {:>6}us  max {:>6}us",
+        t.len(),
+        us(t[0]),
+        us(t[t.len() / 2]),
+        us(t[t.len() * 9 / 10]),
+        us(*t.last().unwrap())
+    );
+}
+
+async fn bench(remote: &Remote, a: &AttachOk, adapter: std::net::SocketAddr, rounds: usize) -> Result<()> {
+    // Network floor: one QUIC round trip on the control stream.
+    let mut pings = Vec::new();
+    for _ in 0..rounds.min(50) {
+        pings.push(remote.ping().await?);
+    }
+    stats("QUIC ping (network floor)", pings);
+
+    let mut sock = TcpStream::connect(adapter).await?;
+    sock.set_nodelay(true)?;
+    sock.write_all(&usbip::import_request()).await?;
+    usbip::expect_import_reply(&mut sock).await?;
+    let mut v = Vhci { sock, seq: 0 };
+
+    // GET_DESCRIPTOR(device) over the control pipe.
+    let setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 18, 0];
+    let mut ctl = Vec::new();
+    for _ in 0..rounds.min(50) {
+        let t = Instant::now();
+        let s = v.submit(0, true, 18, setup, &[]).await?;
+        let (cmd, seq, status, data) = v.reply(|_| true).await?;
+        if cmd != usbip::RET_SUBMIT || seq != s || status != 0 || data != a.descriptors.device {
+            bail!("bad GET_DESCRIPTOR reply: cmd {cmd} seq {seq} status {status} data {data:02x?}");
+        }
+        ctl.push(t.elapsed());
+    }
+    stats("control GET_DESCRIPTOR(device)", ctl);
+
+    // FIDO: the HID interface with interrupt IN + OUT.
+    let (ep_in, ep_out) = {
+        let mut found = None;
+        for o in a.endpoints.iter().filter(|e| e.xfer == XferType::Interrupt && e.address & 0x80 == 0) {
+            if let Some(i) = a.endpoints.iter().find(|e| {
+                e.xfer == XferType::Interrupt && e.address & 0x80 != 0 && e.interface == o.interface
+            }) {
+                found = Some((i.address, o.address));
+            }
+        }
+        found.context("no interrupt IN+OUT pair (not a FIDO device?)")?
+    };
+    println!("FIDO endpoints: IN {ep_in:#04x} OUT {ep_out:#04x}");
+
+    let mut init = Vec::new();
+    let mut cid = [0xff; 4];
+    for round in 0..rounds {
+        let nonce = (round as u64 ^ 0x1122_3344_5566_0000).to_be_bytes();
+        let mut pkt = [0u8; 64];
+        pkt[..4].copy_from_slice(&[0xff; 4]);
+        pkt[4] = 0x86;
+        pkt[5..7].copy_from_slice(&8u16.to_be_bytes());
+        pkt[7..15].copy_from_slice(&nonce);
+
+        let t = Instant::now();
+        let in_seq = v.submit(ep_in, true, 64, [0; 8], &[]).await?;
+        let out_seq = v.submit(ep_out, false, 64, [0; 8], &pkt).await?;
+        let mut got_in = None;
+        let mut got_out = false;
+        while got_in.is_none() || !got_out {
+            let (cmd, seq, status, data) = v.reply(|s| s == in_seq).await?;
+            if cmd != usbip::RET_SUBMIT || status != 0 {
+                bail!("transfer failed: cmd {cmd} seq {seq} status {status}");
+            }
+            if seq == in_seq {
+                got_in = Some(data);
+            } else if seq == out_seq {
+                got_out = true;
+            }
+        }
+        let data = got_in.unwrap();
+        if data.len() < 15 || data[4] != 0x86 || data[7..15] != nonce {
+            bail!("unexpected CTAPHID reply {data:02x?}");
+        }
+        cid.copy_from_slice(&data[15..19]);
+        init.push(t.elapsed());
+    }
+    stats("FIDO CTAPHID_INIT (OUT+IN)", init);
+
+    // Unlink: park an IN transfer (the key has nothing to say) and cancel it,
+    // as usbhid does on close.
+    let target = v.submit(ep_in, true, 64, [0; 8], &[]).await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let t = Instant::now();
+    let useq = v.unlink(target).await?;
+    let (cmd, seq, status, _) = v.reply(|s| s == target).await?;
+    println!(
+        "unlink parked IN: reply cmd {cmd} seq {seq} status {status} in {:?} -> {}",
+        t.elapsed(),
+        if cmd == usbip::RET_UNLINK && seq == useq && status == -104 { "OK" } else { "UNEXPECTED" }
+    );
+
+    // 1 KB CTAPHID_PING, driven exactly like Linux usbhid + hidraw: one IN URB
+    // always pending and resubmitted on completion, each OUT report waited for.
+    let payload: Vec<u8> = (0..1024u32).map(|i| (i * 7) as u8).collect();
+    let mut in_seq = v.submit(ep_in, true, 64, [0; 8], &[]).await?;
+    let mut pings = Vec::new();
+    for _ in 0..(rounds / 10).max(5) {
+        let t = Instant::now();
+        let echoed = ctap_ping(&mut v, ep_in, ep_out, cid, &payload, &mut in_seq).await?;
+        if echoed != payload {
+            bail!("CTAPHID_PING echo mismatch");
+        }
+        pings.push(t.elapsed());
+    }
+    stats("FIDO 1 KB CTAPHID_PING (usbhid-style)", pings);
+    Ok(())
+}
+
+/// Send one CTAPHID message and collect the reply, usbhid style. Returns the reply payload.
+async fn ctap_ping(
+    v: &mut Vhci,
+    ep_in: u8,
+    ep_out: u8,
+    cid: [u8; 4],
+    payload: &[u8],
+    in_seq: &mut u32,
+) -> Result<Vec<u8>> {
+    // Fragment: init packet carries 57 bytes, continuation packets 59.
+    let mut packets = Vec::new();
+    let mut p = [0u8; 64];
+    p[..4].copy_from_slice(&cid);
+    p[4] = 0x81; // CTAPHID_PING
+    p[5..7].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+    let first = payload.len().min(57);
+    p[7..7 + first].copy_from_slice(&payload[..first]);
+    packets.push(p);
+    for (seq, chunk) in payload[first..].chunks(59).enumerate() {
+        let mut p = [0u8; 64];
+        p[..4].copy_from_slice(&cid);
+        p[4] = seq as u8;
+        p[5..5 + chunk.len()].copy_from_slice(chunk);
+        packets.push(p);
+    }
+
+    // Reports on our channel; anything else (e.g. keep-alives) is dropped.
+    let mut reports: Vec<Vec<u8>> = Vec::new();
+    let keep = |data: Vec<u8>, reports: &mut Vec<Vec<u8>>| {
+        if data.len() == 64 && data[..4] == cid {
+            reports.push(data);
+        }
+    };
+    for pkt in &packets {
+        let out_seq = v.submit(ep_out, false, 64, [0; 8], pkt).await?;
+        loop {
+            let cur_in = *in_seq;
+            let (cmd, seq, status, data) = v.reply(|s| s == cur_in).await?;
+            if cmd != usbip::RET_SUBMIT || status != 0 {
+                bail!("transfer failed: cmd {cmd} seq {seq} status {status}");
+            }
+            if seq == cur_in {
+                keep(data, &mut reports);
+                *in_seq = v.submit(ep_in, true, 64, [0; 8], &[]).await?;
+            } else if seq == out_seq {
+                break;
+            }
+        }
+    }
+    let total = payload.len();
+    let have = |r: &Vec<Vec<u8>>| -> usize {
+        if r.is_empty() { 0 } else { (57 + (r.len() - 1) * 59).min(total) }
+    };
+    let ctap_error = |r: &Vec<Vec<u8>>| -> Result<()> {
+        match r.first() {
+            Some(f) if f[4] == 0xbf => bail!("device answered CTAPHID_ERROR {:#04x} after {} OUT packets", f[7], packets.len()),
+            _ => Ok(()),
+        }
+    };
+    ctap_error(&reports)?;
+    while have(&reports) < total {
+        ctap_error(&reports)?;
+        let cur_in = *in_seq;
+        let (cmd, seq, status, data) = v.reply(|s| s == cur_in).await?;
+        if cmd != usbip::RET_SUBMIT || status != 0 || seq != cur_in {
+            bail!("unexpected reply: cmd {cmd} seq {seq} status {status}");
+        }
+        keep(data, &mut reports);
+        *in_seq = v.submit(ep_in, true, 64, [0; 8], &[]).await?;
+    }
+    let first = reports.first().context("no reply")?;
+    if first[4] != 0x81 {
+        bail!("CTAPHID error reply {first:02x?}");
+    }
+    let mut out = first[7..64].to_vec();
+    for r in &reports[1..] {
+        out.extend_from_slice(&r[5..64]);
+    }
+    out.truncate(total);
+    Ok(out)
+}

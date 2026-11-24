@@ -1,0 +1,18 @@
+[package]
+name = "winswap"
+description = "PoC: swap a USB device to WinUSB for export, restore it, and probe it with nusb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nusb.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Devices_DeviceAndDriverInstallation",
+  "Win32_Devices_Properties",
+] }

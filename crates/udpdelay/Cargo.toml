@@ -1,0 +1,10 @@
+[package]
+name = "udpdelay"
+description = "Test tool: UDP relay that adds a fixed one-way delay (WAN emulation without netem)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true

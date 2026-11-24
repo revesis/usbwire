@@ -1,0 +1,18 @@
+[package]
+name = "usbwire-net"
+description = "QUIC transport helpers shared by usbwire server and client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+usbwire-proto.workspace = true
+quinn.workspace = true
+rcgen.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+serde.workspace = true
+spake2.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+getrandom.workspace = true
