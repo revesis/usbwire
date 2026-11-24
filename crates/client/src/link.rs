@@ -183,10 +183,13 @@ pub async fn supervise(
             }
         };
         link_tx.send_replace(None);
-        if let quinn::ConnectionError::ApplicationClosed(c) = &reason
-            && c.error_code == usbwire_net::CLOSE_SUPERSEDED.into()
-        {
-            bail!("another session of this client took over the device; not reconnecting");
+        if let quinn::ConnectionError::ApplicationClosed(c) = &reason {
+            if c.error_code == usbwire_net::CLOSE_SUPERSEDED.into() {
+                bail!("another session of this client took over the device; not reconnecting");
+            }
+            if c.error_code == usbwire_net::CLOSE_REVOKED.into() {
+                bail!("the server revoked this client; pair again to use it");
+            }
         }
         if !reconnect {
             bail!("connection to the server lost: {reason}");

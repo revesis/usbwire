@@ -317,6 +317,9 @@ pub struct OpenDevice {
     pub endpoints: HashMap<u8, EndpointInfo>,
     pub config_value: u8,
     pub snapshot: DescriptorSnapshot,
+    /// Endpoint tasks that are running, by address: where a CLEAR_FEATURE
+    /// (ENDPOINT_HALT) goes, since the task owns the endpoint.
+    pub halt_requests: std::sync::Mutex<HashMap<u8, crate::endpoint::HaltSender>>,
     /// Last: released after the device handles are closed.
     _lease: Lease,
 }
@@ -374,6 +377,7 @@ impl OpenDevice {
             endpoints,
             config_value,
             snapshot,
+            halt_requests: Default::default(),
             _lease: lease,
         })
     }

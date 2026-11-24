@@ -454,6 +454,8 @@ async fn bench(remote: &Remote, a: &AttachOk, adapter: std::net::SocketAddr, rou
         if cmd == usbip::RET_UNLINK && seq == useq && status == -104 { "OK" } else { "UNEXPECTED" }
     );
 
+    stall_recovery(&mut v, ep_in, ep_out).await?;
+
     // 1 KB CTAPHID_PING, driven exactly like Linux usbhid + hidraw: one IN URB
     // always pending and resubmitted on completion, each OUT report waited for.
     let payload: Vec<u8> = (0..1024u32).map(|i| (i * 7) as u8).collect();
@@ -468,6 +470,63 @@ async fn bench(remote: &Remote, a: &AttachOk, adapter: std::net::SocketAddr, rou
         pings.push(t.elapsed());
     }
     stats("FIDO 1 KB CTAPHID_PING (usbhid-style)", pings);
+    Ok(())
+}
+
+/// Halt the FIDO OUT endpoint on the device (SET_FEATURE(ENDPOINT_HALT)),
+/// then check what a host would see: the early-acked OUT that hits the halt
+/// fails later, so the next OUT gets EPIPE; CLEAR_FEATURE(ENDPOINT_HALT)
+/// reaches the device and a full CTAPHID_INIT works again.
+async fn stall_recovery(v: &mut Vhci, ep_in: u8, ep_out: u8) -> Result<()> {
+    const EPIPE: i32 = -32;
+    let control = async |v: &mut Vhci, request: u8| -> Result<i32> {
+        let s = v.submit(0, false, 0, [0x02, request, 0, 0, ep_out, 0, 0, 0], &[]).await?;
+        let (_, seq, status, _) = v.reply(|_| false).await?;
+        if seq != s {
+            bail!("control reply for seq {seq}, expected {s}");
+        }
+        Ok(status)
+    };
+    let mut pkt = [0u8; 64];
+    pkt[..4].copy_from_slice(&[0xff; 4]);
+    pkt[4] = 0x86;
+    pkt[5..7].copy_from_slice(&8u16.to_be_bytes());
+    pkt[7..15].copy_from_slice(b"stalltst");
+
+    let set = control(v, 0x03).await?;
+    if set != 0 {
+        println!("stall recovery: device refused SET_FEATURE(ENDPOINT_HALT) (status {set}); skipped");
+        return Ok(());
+    }
+    let s1 = v.submit(ep_out, false, 64, [0; 8], &pkt).await?;
+    let (_, _, st1, _) = v.reply(|_| false).await?;
+    // Give the device's failure time to come back as a deferred error.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let s2 = v.submit(ep_out, false, 64, [0; 8], &pkt).await?;
+    let (_, seq2, st2, _) = v.reply(|_| false).await?;
+    let cleared = control(v, 0x01).await?;
+
+    // A full round trip afterwards.
+    let in_seq = v.submit(ep_in, true, 64, [0; 8], &[]).await?;
+    v.submit(ep_out, false, 64, [0; 8], &pkt).await?;
+    let mut works = false;
+    for _ in 0..4 {
+        let (cmd, seq, status, data) = v.reply(|s| s == in_seq).await?;
+        if cmd == usbip::RET_SUBMIT && seq == in_seq && status == 0 && data.get(7..15) == Some(&b"stalltst"[..]) {
+            works = true;
+            break;
+        }
+    }
+    let ok = st1 == 0 && seq2 == s2 && st2 == EPIPE && cleared == 0 && works;
+    println!(
+        "stall recovery: OUT on halted ep acked {st1} (seq {s1}), next OUT {st2} (want {EPIPE}), \
+         CLEAR_FEATURE {cleared}, INIT afterwards {} -> {}",
+        if works { "ok" } else { "FAILED" },
+        if ok { "OK" } else { "UNEXPECTED" }
+    );
+    if !ok {
+        bail!("stall recovery did not behave as on a local device");
+    }
     Ok(())
 }
 

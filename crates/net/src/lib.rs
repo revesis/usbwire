@@ -30,6 +30,9 @@ pub const CLOSE_NORMAL: u32 = 0;
 /// not reconnect, or two copies of it would take the device from each other
 /// forever.
 pub const CLOSE_SUPERSEDED: u32 = 2;
+/// QUIC application close code: the client was revoked on the server
+/// (`usbwire-server revoke`). It must not reconnect.
+pub const CLOSE_REVOKED: u32 = 3;
 
 /// Reads whole frames from a QUIC receive stream.
 pub struct FrameReader {

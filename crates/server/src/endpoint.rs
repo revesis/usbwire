@@ -8,7 +8,7 @@ use std::task::{Context, Poll};
 use anyhow::{Context as _, Result, bail};
 use nusb::Endpoint;
 use nusb::transfer::{Buffer, Bulk, Completion, ControlIn, ControlOut, In, Interrupt, Out};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 use usbwire_net::{FrameReader, quinn, send};
 use usbwire_proto::{Complete, EpMsg, Status, Submit, UrbId, XferType};
@@ -76,9 +76,8 @@ async fn control(dev: &OpenDevice, s: &Submit) -> Complete {
                 };
             }
             (2, 0x01) if value == 0 => {
-                // CLEAR_FEATURE(ENDPOINT_HALT). TODO(phase 1): route to the endpoint task's clear_halt().
-                debug!(ep = index, "CLEAR_FEATURE(ENDPOINT_HALT) acknowledged without action");
-                return done(Status::Ok, vec![], 0);
+                // CLEAR_FEATURE(ENDPOINT_HALT): the host recovering from a stall.
+                return done(clear_halt(dev, index as u8).await, vec![], 0);
             }
             _ => {}
         }
@@ -152,11 +151,78 @@ impl Ep {
     fn pending(&self) -> usize {
         each!(self, e => e.pending())
     }
+    /// Clear the halt; a failed request is reported as a stall, the way a
+    /// device answers a control request it rejects.
+    async fn clear_halt(&mut self) -> Status {
+        match each!(self, e => e.clear_halt().await) {
+            Ok(()) => Status::Ok,
+            Err(e) => {
+                warn!("clear halt failed: {e}");
+                Status::Stall
+            }
+        }
+    }
 }
 
 enum Event {
     Msg(Option<EpMsg>),
     Done(Completion),
+    /// CLEAR_FEATURE(ENDPOINT_HALT) from the control pipe; answer on the sender.
+    ClearHalt(oneshot::Sender<Status>),
+}
+
+/// Asks a running endpoint task to clear its endpoint's halt.
+pub type HaltSender = mpsc::UnboundedSender<oneshot::Sender<Status>>;
+
+/// Clear a halted endpoint. The task running it does the work (nusb wants no
+/// transfers pending, and only the task knows them); if no task runs it,
+/// open the endpoint just for this.
+async fn clear_halt(dev: &OpenDevice, addr: u8) -> Status {
+    let task = dev.halt_requests.lock().unwrap().get(&addr).cloned();
+    if let Some(task) = task {
+        let (tx, rx) = oneshot::channel();
+        if task.send(tx).is_ok()
+            && let Ok(st) = rx.await
+        {
+            debug!(ep = addr, ?st, "cleared halt via the endpoint task");
+            return st;
+        }
+    }
+    let st = match open_ep(dev, addr) {
+        Ok(mut ep) => ep.clear_halt().await,
+        Err(e) => {
+            warn!(ep = addr, "CLEAR_FEATURE(ENDPOINT_HALT): {e:#}");
+            Status::Stall
+        }
+    };
+    debug!(ep = addr, ?st, "cleared halt");
+    st
+}
+
+fn open_ep(dev: &OpenDevice, addr: u8) -> Result<Ep> {
+    let info = *dev.endpoints.get(&addr).with_context(|| format!("no endpoint {addr:#04x}"))?;
+    let intf = dev.interfaces.get(&info.interface).context("endpoint's interface not claimed")?;
+    Ok(match (info.xfer, addr & 0x80 != 0) {
+        (XferType::Bulk, true) => Ep::BulkIn(intf.endpoint(addr)?),
+        (XferType::Bulk, false) => Ep::BulkOut(intf.endpoint(addr)?),
+        (XferType::Interrupt, true) => Ep::IntIn(intf.endpoint(addr)?),
+        (XferType::Interrupt, false) => Ep::IntOut(intf.endpoint(addr)?),
+        (x, _) => bail!("{x:?} endpoints are not supported"),
+    })
+}
+
+/// Unregisters an endpoint task's halt channel when the task ends.
+struct HaltRegistration(Arc<OpenDevice>, u8);
+
+impl Drop for HaltRegistration {
+    fn drop(&mut self) {
+        self.0.halt_requests.lock().unwrap().remove(&self.1);
+    }
+}
+
+/// Wait for one completion on the endpoint (there must be one pending).
+async fn next_complete(ep: &mut Ep) -> Completion {
+    poll_fn(|cx| ep.poll_next_complete(cx)).await
 }
 
 /// Interrupt IN reads kept pending on the device while a push endpoint is open.
@@ -170,16 +236,10 @@ pub async fn run_data(
     mut tx: quinn::SendStream,
     mut rx: FrameReader,
 ) -> Result<()> {
-    let info = *dev.endpoints.get(&addr).with_context(|| format!("no endpoint {addr:#04x}"))?;
-    let intf = dev.interfaces.get(&info.interface).context("endpoint's interface not claimed")?;
-    let is_in = addr & 0x80 != 0;
-    let mut ep = match (info.xfer, is_in) {
-        (XferType::Bulk, true) => Ep::BulkIn(intf.endpoint(addr)?),
-        (XferType::Bulk, false) => Ep::BulkOut(intf.endpoint(addr)?),
-        (XferType::Interrupt, true) => Ep::IntIn(intf.endpoint(addr)?),
-        (XferType::Interrupt, false) => Ep::IntOut(intf.endpoint(addr)?),
-        (x, _) => bail!("{x:?} endpoints are not supported"),
-    };
+    let mut ep = open_ep(&dev, addr)?;
+    let (halt_tx, mut halt_rx) = mpsc::unbounded_channel();
+    dev.halt_requests.lock().unwrap().insert(addr, halt_tx);
+    let _registration = HaltRegistration(dev.clone(), addr);
     debug!(ep = addr, "endpoint stream open");
 
     // Reader task: turns the QUIC stream into a channel we can poll alongside nusb.
@@ -202,17 +262,20 @@ pub async fn run_data(
     });
 
     if push && matches!(ep, Ep::IntIn(_)) {
-        return run_push(ep, addr, tx, msg_rx).await;
+        return run_push(ep, addr, tx, msg_rx, halt_rx).await;
     }
 
     // In submission order; nusb completes transfers in order per endpoint.
-    let mut pending: VecDeque<(UrbId, u32)> = VecDeque::new();
+    let mut pending: VecDeque<Pending> = VecDeque::new();
     loop {
         let ev = poll_fn(|cx| {
             if !pending.is_empty()
                 && let Poll::Ready(c) = ep.poll_next_complete(cx)
             {
                 return Poll::Ready(Event::Done(c));
+            }
+            if let Poll::Ready(Some(reply)) = halt_rx.poll_recv(cx) {
+                return Poll::Ready(Event::ClearHalt(reply));
             }
             msg_rx.poll_recv(cx).map(Event::Msg)
         })
@@ -233,38 +296,74 @@ pub async fn run_data(
                 };
                 debug!(ep = addr, urb = s.urb, len = s.length, early = s.acked_early, "submit");
                 ep.submit(buf);
-                pending.push_back((s.urb, s.length));
+                pending.push_back(Pending { urb: s.urb, length: s.length, acked_early: s.acked_early });
             }
             Event::Msg(Some(EpMsg::Cancel { urb })) => {
                 // nusb can only cancel everything pending on the endpoint. With
                 // HID there is normally one transfer in flight, so this is exact.
-                if pending.iter().any(|(u, _)| *u == urb) {
+                if pending.iter().any(|p| p.urb == urb) {
                     ep.cancel_all();
                 }
             }
             Event::Msg(Some(other)) => warn!("unexpected message on endpoint stream: {other:?}"),
             Event::Done(c) => {
-                let (urb, requested) = pending.pop_front().expect("completion without pending transfer");
-                debug!(ep = addr, urb, status = ?c.status, actual = c.actual_len, "complete");
-                let mut st = status(c.status);
-                let (data, actual_length) = if ep.is_in() {
-                    let mut data = c.buffer.into_vec();
-                    data.truncate(c.actual_len);
-                    if data.len() > requested as usize {
-                        data.truncate(requested as usize);
-                        if st.is_ok() {
-                            st = Status::Overflow;
+                let p = pending.pop_front().expect("completion without pending transfer");
+                if let Some(msg) = completion_msg(&ep, addr, p, c) {
+                    send(&mut tx, &msg).await?;
+                }
+            }
+            Event::ClearHalt(reply) => {
+                // nusb wants nothing pending; whatever is, fails like on a stalled pipe.
+                if !pending.is_empty() {
+                    ep.cancel_all();
+                    while let Some(p) = pending.pop_front() {
+                        let c = next_complete(&mut ep).await;
+                        if let Some(msg) = completion_msg(&ep, addr, p, c) {
+                            send(&mut tx, &msg).await?;
                         }
                     }
-                    let n = data.len() as u32;
-                    (data, n)
-                } else {
-                    (Vec::new(), c.actual_len as u32)
-                };
-                send(&mut tx, &EpMsg::Complete(Complete { urb, status: st, actual_length, data })).await?;
+                }
+                let _ = reply.send(ep.clear_halt().await);
             }
         }
     }
+}
+
+/// A transfer submitted on a (non-push) data endpoint.
+struct Pending {
+    urb: UrbId,
+    length: u32,
+    /// The client already completed it (early OUT ack): report only failure.
+    acked_early: bool,
+}
+
+/// What to tell the client about a finished transfer, if anything.
+fn completion_msg(ep: &Ep, addr: u8, p: Pending, c: Completion) -> Option<EpMsg> {
+    debug!(ep = addr, urb = p.urb, status = ?c.status, actual = c.actual_len, "complete");
+    let mut st = status(c.status);
+    if p.acked_early {
+        // The client told the host it succeeded long ago; a failure is
+        // reported so the host sees it on its next transfer.
+        return (!st.is_ok()).then(|| {
+            warn!(ep = addr, urb = p.urb, ?st, "early-acked OUT failed on the device");
+            EpMsg::DeferredError { urb: p.urb, status: st }
+        });
+    }
+    let (data, actual_length) = if ep.is_in() {
+        let mut data = c.buffer.into_vec();
+        data.truncate(c.actual_len);
+        if data.len() > p.length as usize {
+            data.truncate(p.length as usize);
+            if st.is_ok() {
+                st = Status::Overflow;
+            }
+        }
+        let n = data.len() as u32;
+        (data, n)
+    } else {
+        (Vec::new(), c.actual_len as u32)
+    };
+    Some(EpMsg::Complete(Complete { urb: p.urb, status: st, actual_length, data }))
 }
 
 /// Keep PUSH_DEPTH reads pending on a push endpoint.
@@ -282,6 +381,7 @@ async fn run_push(
     addr: u8,
     mut tx: quinn::SendStream,
     mut msg_rx: mpsc::UnboundedReceiver<EpMsg>,
+    mut halt_rx: mpsc::UnboundedReceiver<oneshot::Sender<Status>>,
 ) -> Result<()> {
     let mps = ep.max_packet();
     let mut epoch: Option<UrbId> = None;
@@ -296,6 +396,9 @@ async fn run_push(
             {
                 return Poll::Ready(Event::Done(c));
             }
+            if let Poll::Ready(Some(reply)) = halt_rx.poll_recv(cx) {
+                return Poll::Ready(Event::ClearHalt(reply));
+            }
             msg_rx.poll_recv(cx).map(Event::Msg)
         })
         .await;
@@ -304,6 +407,25 @@ async fn run_push(
             Event::Msg(None) => {
                 ep.cancel_all();
                 return Ok(());
+            }
+            Event::ClearHalt(reply) => {
+                // nusb wants nothing pending: stop the reads, keep what they got.
+                ep.cancel_all();
+                while ep.pending() > 0 {
+                    let c = next_complete(&mut ep).await;
+                    if c.status.is_ok() {
+                        let mut data = c.buffer.into_vec();
+                        data.truncate(c.actual_len);
+                        held.push_back(data);
+                    }
+                }
+                let _ = reply.send(ep.clear_halt().await);
+                if let Some(e) = epoch {
+                    for data in held.drain(..) {
+                        send(&mut tx, &EpMsg::Push { epoch: e, data }).await?;
+                    }
+                    top_up(&mut ep, mps);
+                }
             }
             Event::Msg(Some(EpMsg::Submit(s))) => {
                 if epoch.is_none() {

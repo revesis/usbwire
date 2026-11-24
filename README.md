@@ -34,6 +34,9 @@ of one message. usbwire hides the round trip where USB semantics allow:
 - **Early interrupt OUT ack.** The client completes an interrupt OUT to the
   host straight away and sends the data on. Without it, multi-packet CTAP
   messages fail with `CTAPHID_ERR_MSG_TIMEOUT` once RTT reaches about 20 ms.
+  If such a transfer then fails on the device (a stall), the next transfer
+  on that endpoint fails, which is how a host learns of a stall anyway, and
+  the host's `CLEAR_FEATURE(ENDPOINT_HALT)` reaches the device to clear it.
 - **Interrupt IN push.** The server keeps reads pending on the device and
   pushes reports as they arrive. The client buffers them, so the host's next
   poll is answered locally.
@@ -254,8 +257,9 @@ options: --state DIR  --listen ADDR:PORT
 ```
 
 `pair`, `clients` and `revoke` change files in the state directory, so they
-take effect on a running server or service. Sessions that are already open
-when a client is revoked stay up until they disconnect.
+take effect on a running server or service. A running server also closes a
+revoked client's open sessions within about 2 seconds (logged in
+`audit.log`), and the client stops instead of reconnecting.
 
 ### `usbwire-client`
 
@@ -333,7 +337,5 @@ was tested.
 ## Roadmap
 
 - Tray app for the server (status, pairing code)
-- End open sessions when a client is revoked
-- Report errors on early-acked OUT transfers back to the host
 - NAT traversal
 - macOS client

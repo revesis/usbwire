@@ -20,6 +20,20 @@ struct Server {
     state: Arc<State>,
     registry: Arc<Registry>,
     fingerprint: String,
+    /// Live sessions of paired clients: connection id -> (fingerprint, name, connection).
+    sessions: Mutex<HashMap<usize, (String, String, quinn::Connection)>>,
+}
+
+/// How often the paired-client list is re-read to end revoked sessions.
+const REVOKE_CHECK: Duration = Duration::from_secs(2);
+
+/// Removes a session from `Server::sessions` when the connection handler ends.
+struct SessionGuard<'a>(&'a Server, usize);
+
+impl Drop for SessionGuard<'_> {
+    fn drop(&mut self) {
+        self.0.sessions.lock().unwrap().remove(&self.1);
+    }
 }
 
 /// Serve until `shutdown` resolves, then close connections and give swapped
@@ -35,7 +49,18 @@ pub async fn run(state: Arc<State>, listen: Option<SocketAddr>, shutdown: impl F
     let endpoint = quinn::Endpoint::server(usbwire_net::server_config(identity)?, addr)?;
     info!(state = %state.dir.display(), fingerprint = auth::short_fp(&fingerprint), "listening on {addr}");
 
-    let srv = Arc::new(Server { registry: Registry::new(state.clone()), state, fingerprint });
+    let srv = Arc::new(Server { registry: Registry::new(state.clone()), state, fingerprint, sessions: Default::default() });
+    // `usbwire-server revoke` edits clients.json from another process; end
+    // the revoked client's open sessions here.
+    let watcher = {
+        let srv = srv.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(REVOKE_CHECK).await;
+                srv.close_revoked();
+            }
+        })
+    };
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -56,7 +81,8 @@ pub async fn run(state: Arc<State>, listen: Option<SocketAddr>, shutdown: impl F
     }
 
     info!("shutting down");
-    endpoint.close(0u32.into(), b"server shutting down");
+    watcher.abort();
+    endpoint.close(usbwire_net::CLOSE_NORMAL.into(), b"server shutting down");
     let _ = tokio::time::timeout(Duration::from_secs(3), endpoint.wait_idle()).await;
     srv.registry.restore_all().await;
     info!("stopped");
@@ -70,6 +96,28 @@ fn error(code: ErrorCode, message: impl Into<String>) -> Control {
 }
 
 impl Server {
+    /// Close sessions of clients that are no longer paired.
+    fn close_revoked(&self) {
+        let clients = match self.state.clients() {
+            Ok(c) => c,
+            Err(e) => {
+                // A half-written or broken file must not drop every session.
+                warn!("reading paired clients: {e:#}");
+                return;
+            }
+        };
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.retain(|_, (fp, name, conn)| {
+            if clients.iter().any(|c| &c.fingerprint == fp) {
+                return true;
+            }
+            self.state.audit(&format!("session closed: client revoked client={name} fp={}", auth::short_fp(fp)));
+            info!(client = %name, "closing the session of a revoked client");
+            conn.close(usbwire_net::CLOSE_REVOKED.into(), b"client revoked");
+            false
+        });
+    }
+
     async fn handle_connection(self: Arc<Self>, incoming: quinn::Incoming) -> Result<()> {
         let conn = incoming.await?;
         let remote = conn.remote_address();
@@ -113,6 +161,8 @@ impl Server {
         };
         let who = format!("client={} fp={}", client.name, auth::short_fp(&client_fp));
         self.state.audit(&format!("session start {who} from {remote}"));
+        self.sessions.lock().unwrap().insert(conn.stable_id(), (client_fp.clone(), client.name.clone(), conn.clone()));
+        let _session = SessionGuard(&self, conn.stable_id());
 
         let attached: Attached = Default::default();
         let ep_conn = conn.clone();

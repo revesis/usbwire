@@ -96,7 +96,7 @@ fn main() -> Result<()> {
                 state.audit(&format!("revoked client={} fp={}", c.name, auth::short_fp(&c.fingerprint)));
                 println!("revoked {} ({})", c.name, auth::short_fp(&c.fingerprint));
             }
-            println!("(sessions already open stay up until they disconnect)");
+            println!("(a running server closes this client's open sessions within a few seconds)");
             Ok(())
         }
         #[cfg(windows)]

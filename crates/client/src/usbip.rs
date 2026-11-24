@@ -170,6 +170,9 @@ struct Session {
     push: HashMap<u8, PushEp>,
     /// Submissions made while there was no connection, sent on reconnect.
     held: VecDeque<(u8, Submit)>,
+    /// An early-acked OUT failed on the device: the next URB on that endpoint
+    /// gets the error, which is how the host learns of a stall.
+    out_error: HashMap<u8, Status>,
 }
 
 impl Session {
@@ -207,6 +210,21 @@ impl Session {
             }
         }
         Resume { restart, held: self.held.drain(..).collect() }
+    }
+}
+
+/// The endpoint a CLEAR_FEATURE(ENDPOINT_HALT) request is for.
+fn clear_halt_target(setup: &[u8; 8]) -> Option<u8> {
+    (setup[0] == 0x02 && setup[1] == 0x01 && setup[2] == 0 && setup[3] == 0).then_some(setup[4])
+}
+
+impl Session {
+    /// Errors held for `ep` are void once the host has cleared its halt.
+    fn forget_errors(&mut self, ep: u8) {
+        self.out_error.remove(&ep);
+        if let Some(pe) = self.push.get_mut(&ep) {
+            pe.deferred = None;
+        }
     }
 }
 
@@ -377,8 +395,10 @@ impl Adapter {
                     }
                 }
                 Some(_) => {}
-                // TODO: fail the next URB on the endpoint instead of only logging.
-                None => warn!(ep, urb, ?status, "early-acked OUT failed on the device"),
+                None => {
+                    warn!(ep, urb, ?status, "early-acked OUT failed on the device; failing the next transfer");
+                    sess.out_error.insert(ep, status);
+                }
             },
         }
     }
@@ -506,6 +526,12 @@ impl Adapter {
                     let _ = local.send(ret_submit(seq, 0, &d, true, d.len() as u32));
                     return;
                 }
+                if let Some(halted) = setup.as_ref().and_then(clear_halt_target) {
+                    // The host clears a halt: errors we were holding for that
+                    // endpoint are answered by this. The request still goes to
+                    // the device, which clears the real halt.
+                    sess.lock().unwrap().forget_errors(halted);
+                }
 
                 if self.is_push(ep) {
                     let start = {
@@ -537,6 +563,11 @@ impl Adapter {
                 }
 
                 let acked_early = self.early_ack(ep);
+                if acked_early && let Some(st) = sess.lock().unwrap().out_error.remove(&ep) {
+                    // A previous OUT failed after we acked it: fail this one instead.
+                    let _ = local.send(ret_submit(seq, errno(st), &[], false, 0));
+                    return;
+                }
                 if acked_early {
                     let _ = local.send(ret_submit(seq, 0, &[], false, len));
                 } else {
@@ -834,6 +865,23 @@ mod tests {
         assert_eq!(s.push[&0x84].epoch, Some(11));
         assert_eq!(s.push[&0x83].epoch, None);
         assert!(s.held.is_empty());
+    }
+
+
+    #[test]
+    fn failed_early_acked_out_fails_the_next_urb_until_halt_is_cleared() {
+        let mut s = Session::default();
+        let mut out = Vec::new();
+        // No push endpoint 0x04: this is an interrupt OUT that was acked early.
+        Adapter::on_event(&mut s, EpEvent::Deferred { ep: 0x04, urb: 7, status: Status::Stall }, &mut out);
+        assert!(out.is_empty());
+        assert_eq!(s.out_error.get(&0x04), Some(&Status::Stall));
+        // CLEAR_FEATURE(ENDPOINT_HALT) for 0x04.
+        let setup = [0x02, 0x01, 0, 0, 0x04, 0, 0, 0];
+        assert_eq!(clear_halt_target(&setup), Some(0x04));
+        assert_eq!(clear_halt_target(&[0x80, 0x06, 0, 1, 0, 0, 18, 0]), None);
+        s.forget_errors(0x04);
+        assert!(s.out_error.is_empty());
     }
 
 }
