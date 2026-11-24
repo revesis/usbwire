@@ -1,0 +1,15 @@
+[package]
+name = "fidoping"
+version.workspace = true
+edition.workspace = true
+description = "Times CTAPHID round trips to a FIDO key through the OS HID stack (Windows HID, Linux hidraw)"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Devices_DeviceAndDriverInstallation",
+  "Win32_Devices_HumanInterfaceDevice",
+  "Win32_Storage_FileSystem",
+  "Win32_Security",
+  "Win32_System_IO",
+] }

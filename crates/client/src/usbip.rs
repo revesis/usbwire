@@ -287,10 +287,11 @@ impl Adapter {
                     }
                 }
             }
-            EpEvent::Push { ep, epoch, data } => {
-                let Some(pe) = sess.push.get_mut(&ep).filter(|pe| pe.epoch == Some(epoch)) else {
-                    return; // from an earlier open of the endpoint
-                };
+            EpEvent::Push { ep, data } => {
+                // Every push is a report the device really sent: keep it even if
+                // polling has stopped since (it was in flight), and hand it to the
+                // next IN URB, as a device would with a report nobody polled yet.
+                let pe = sess.push.entry(ep).or_default();
                 match pe.pending.pop_front() {
                     Some((seq, len)) => out.extend(ret_in(seq, len, data)),
                     None => {
@@ -434,8 +435,8 @@ impl Adapter {
                                 pe.pending.remove(i);
                                 // usbhid unlinks its IN URB when the device is closed:
                                 // stop reading so the device isn't drained while nobody listens.
+                                // Reports already read stay buffered for the next reader.
                                 let stop = if pe.pending.is_empty() {
-                                    pe.buffer.clear();
                                     pe.epoch.take()
                                 } else {
                                     None
@@ -554,19 +555,23 @@ mod tests {
         let mut s = push_session(10);
         s.push.get_mut(&0x84).unwrap().pending.push_back((11, 64));
         let mut out = Vec::new();
-        Adapter::on_event(&mut s, EpEvent::Push { ep: 0x84, epoch: 10, data: vec![7; 64] }, &mut out);
+        Adapter::on_event(&mut s, EpEvent::Push { ep: 0x84, data: vec![7; 64] }, &mut out);
         assert_eq!(parse(&out), vec![(RET_SUBMIT, 11, 0, vec![7; 64])]);
         assert!(s.push[&0x84].pending.is_empty());
     }
 
     #[test]
-    fn push_before_urb_is_buffered_and_stale_epoch_dropped() {
+    fn push_before_urb_is_buffered_even_after_stop() {
+        // Reports in flight when polling stopped are real device data: keep
+        // them, in order, for the next IN URB.
         let mut s = push_session(10);
         let mut out = Vec::new();
-        Adapter::on_event(&mut s, EpEvent::Push { ep: 0x84, epoch: 3, data: vec![1] }, &mut out);
-        Adapter::on_event(&mut s, EpEvent::Push { ep: 0x84, epoch: 10, data: vec![2] }, &mut out);
+        Adapter::on_event(&mut s, EpEvent::Push { ep: 0x84, data: vec![1] }, &mut out);
+        s.push.get_mut(&0x84).unwrap().epoch = None; // the host unlinked its last URB
+        Adapter::on_event(&mut s, EpEvent::Push { ep: 0x84, data: vec![2] }, &mut out);
+        Adapter::on_event(&mut s, EpEvent::Push { ep: 0x84, data: vec![3] }, &mut out);
         assert!(out.is_empty());
-        assert_eq!(s.push[&0x84].buffer, VecDeque::from([vec![2]]));
+        assert_eq!(s.push[&0x84].buffer, VecDeque::from([vec![1], vec![2], vec![3]]));
     }
 
     #[test]
@@ -574,7 +579,7 @@ mod tests {
         let mut s = push_session(1);
         let mut out = Vec::new();
         for i in 0..(PUSH_BUFFER + 5) {
-            Adapter::on_event(&mut s, EpEvent::Push { ep: 0x84, epoch: 1, data: vec![i as u8] }, &mut out);
+            Adapter::on_event(&mut s, EpEvent::Push { ep: 0x84, data: vec![i as u8] }, &mut out);
         }
         let b = &s.push[&0x84].buffer;
         assert_eq!(b.len(), PUSH_BUFFER);
@@ -596,7 +601,7 @@ mod tests {
         let mut s = push_session(1);
         s.push.get_mut(&0x84).unwrap().pending.push_back((2, 8));
         let mut out = Vec::new();
-        Adapter::on_event(&mut s, EpEvent::Push { ep: 0x84, epoch: 1, data: vec![9; 64] }, &mut out);
+        Adapter::on_event(&mut s, EpEvent::Push { ep: 0x84, data: vec![9; 64] }, &mut out);
         assert_eq!(parse(&out), vec![(RET_SUBMIT, 2, -75, vec![9; 8])]);
     }
 

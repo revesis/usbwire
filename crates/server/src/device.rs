@@ -81,6 +81,7 @@ impl Registry {
     fn offered(&self, d: &nusb::DeviceInfo, allow: &[String]) -> Result<bool> {
         let cfg = self.state.config()?;
         Ok(d.class() != 0x09
+            && !is_remote(d)
             && state::any_matches(&cfg.export, d.vendor_id(), d.product_id())
             && state::any_matches(allow, d.vendor_id(), d.product_id()))
     }
@@ -265,6 +266,24 @@ pub struct Lease {
 impl Drop for Lease {
     fn drop(&mut self) {
         self.registry.release(&self.key, self.conn_id);
+    }
+}
+
+/// A device that is itself attached over USB/IP (usbip-win2 on this machine).
+/// Exporting it would loop it back through the server.
+fn is_remote(d: &nusb::DeviceInfo) -> bool {
+    #[cfg(windows)]
+    {
+        winswap::swap::is_usbip_virtual(&d.instance_id().to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        // Linux: vhci_hcd root hubs.
+        let bus = std::path::Path::new("/sys/bus/usb/devices").join(format!("usb{}", d.busnum()));
+        std::fs::read_link(bus.join("..").canonicalize().unwrap_or_default().join("driver"))
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().starts_with("vhci_hcd")))
+            .unwrap_or(false)
     }
 }
 

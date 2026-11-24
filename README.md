@@ -10,18 +10,19 @@ system's own USB/IP driver, so applications (browsers, `libfido2`, `ssh`,
 `gpg`) see an ordinary local key.
 
 ```
- Windows server                                   Client (Linux today)
- ┌──────────────────────────┐   QUIC / UDP 7443   ┌────────────────────────────┐
- │ YubiKey ── WinUSB        │◄═══════════════════►│ usbwire-client serve       │
- │ usbwire-server (service) │  mTLS, paired certs │   └─ USB/IP on 127.0.0.1   │
- └──────────────────────────┘                     │ vhci_hcd ── /dev/hidrawN   │
-                                                  └────────────────────────────┘
+ Windows server                                   Client (Linux or Windows)
+ ┌──────────────────────────┐   QUIC / UDP 7443   ┌──────────────────────────────┐
+ │ YubiKey ── WinUSB        │◄═══════════════════►│ usbwire-client serve         │
+ │ usbwire-server (service) │  mTLS, paired certs │   └─ USB/IP on 127.0.0.1     │
+ └──────────────────────────┘                     │ vhci_hcd / usbip-win2 driver │
+                                                  │   └─ an ordinary local key   │
+                                                  └──────────────────────────────┘
 ```
 
 | Status | |
 |---|---|
 | Server | Windows 10/11 (also runs on Linux for development) |
-| Client | Linux (vhci_hcd). Windows through usbip-win2 is planned; macOS later |
+| Client | Linux (vhci_hcd) and Windows 10/11 ([usbip-win2](https://github.com/vadimgrn/usbip-win2) driver). macOS later |
 | Devices | Exports Yubico devices (VID `1050`) by default; configurable |
 
 ## Why not plain USB/IP?
@@ -46,9 +47,13 @@ Measured with a YubiKey 5 at an added 100 ms RTT:
 
 | | plain forwarding | usbwire |
 |---|---|---|
-| 1 KB CTAPHID_PING | 2.08 s | 0.19 s |
-| `fido2-token -I` (6 CTAP requests) | 1.54 s | 0.76 s |
-| attach + enumerate | 2.38 s | 1.25 s |
+| 1 KB CTAPHID_PING, Linux client | 2.08 s | 0.19 s |
+| 1 KB CTAPHID_PING, Windows client | fails (`CTAPHID_ERR_MSG_TIMEOUT`) | 0.19 s |
+| `fido2-token -I` (6 CTAP requests), Linux | 1.54 s | 0.76 s |
+| attach until the key is usable, Windows | 4.5 s | 1.7 s |
+
+With no added delay, the Windows client is as fast as the key plugged in
+directly: CTAPHID_INIT p50 4.00 ms both ways, 1 KB PING 72 ms both ways.
 
 ## Security
 
@@ -100,6 +105,7 @@ To cross-compile from Linux, install `mingw-w64-gcc` and run
 | `client` | `usbwire-client`: QUIC client and local USB/IP adapter |
 | `winswap` | WinUSB swap and restore through SetupAPI, plus a debugging CLI |
 | `udpdelay` | UDP relay that adds a fixed delay, for WAN tests |
+| `fidoping` | Times CTAPHID INIT and 1 KB PING through the OS HID stack (Windows, Linux); no touch needed |
 
 ## Setup
 
@@ -140,18 +146,40 @@ usbwire-client pair --server SERVER_HOST:7443 --code 7K3QD-M9XAB
 Check that the server key fingerprint printed on the client matches the one
 on the server.
 
-### 3. Use the key (Linux client)
+### 3a. Use the key: Linux client
 
 ```sh
 sudo modprobe vhci-hcd
 usbwire-client list  --server SERVER_HOST:7443
-usbwire-client serve --server SERVER_HOST:7443 --dev 1050:0407 &
-sudo usbip attach -r 127.0.0.1 -b 1-1
+sudo usbwire-client serve --server SERVER_HOST:7443 --dev 1050:0407 --attach
 fido2-token -L       # the remote key is now a local /dev/hidrawN
 ```
 
-To detach, run `sudo usbip detach -p 0` or stop the client. The server gives
-the device back to its Windows drivers a few seconds later.
+`--attach` runs `usbip attach` for you once the adapter listens. Without it,
+the adapter listens on 127.0.0.1:3240 and you run
+`sudo usbip attach -r 127.0.0.1 -b 1-1` yourself.
+
+### 3b. Use the key: Windows client
+
+1. Install [usbip-win2](https://github.com/vadimgrn/usbip-win2/releases)
+   (0.9.8.1 or later). Its drivers are Microsoft-signed, so this works with
+   Secure Boot on and test signing off. The installer briefly restarts all
+   USB hubs.
+2. Pair as above, then in an Administrator console:
+
+```bat
+usbwire-client serve --server SERVER_HOST:7443 --dev 1050:0407 --attach
+```
+
+The key appears with all its interfaces: FIDO, the OTP keyboard, and the
+CCID smart card reader. `--attach`
+picks a free local port, since 3240 is often taken (for example by
+usbipd-win), and asks usbip-win2 for a single attach attempt, so the device
+goes away when the client stops.
+
+Stop with Ctrl-C: the client closes the connection cleanly, and the server
+gives the device back to its own drivers a few seconds later. If the client
+is killed instead, the server notices after its 30 s idle timeout.
 
 ## Commands
 
@@ -175,7 +203,7 @@ when a client is revoked stay up until they disconnect.
 ```
 usbwire-client pair  --server HOST:PORT --code CODE
 usbwire-client list  --server HOST:PORT
-usbwire-client serve --server HOST:PORT --dev VID:PID [--listen 127.0.0.1:3240]
+usbwire-client serve --server HOST:PORT --dev VID:PID [--listen ADDR] [--attach]
 usbwire-client bench --server HOST:PORT --dev VID:PID [-n 200]
 options: --state DIR  --cert FILE
          --no-early-ack  --no-push  --no-desc-cache   (turn off one optimisation, for comparison)
@@ -225,11 +253,25 @@ server). `ONE_WAY_MS` adds that much delay in each direction through
 ```sh
 SERVER=host:7443 scripts/realbench.sh ONE_WAY_MS     # times fido2-token -I
 SERVER=host:7443 scripts/touchtest.sh [ONE_WAY_MS]   # U2F register + sign; needs two touches
+fidoping                                             # INIT + 1 KB PING on the attached key
 ```
+
+Windows client, in an Administrator console, from the folder with the
+binaries (the client must be paired with the server):
+
+```bat
+powershell -ExecutionPolicy Bypass -File wintest.ps1 -Server HOST:7443 [-OneWayMs 50]
+```
+
+The server also skips devices that are themselves attached over USB/IP
+(below usbip-win2's or vhci_hcd's host controller). That makes it safe to run
+the server and a client on the same machine, which is how the Windows client
+was tested.
 
 ## Roadmap
 
-- Windows client through usbip-win2
+- Reconnect automatically after a network drop
+- Run the Windows client in the background (tray app or service)
 - Tray app for the server (status, pairing code)
 - End open sessions when a client is revoked
 - Report errors on early-acked OUT transfers back to the host

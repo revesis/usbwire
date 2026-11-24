@@ -2,8 +2,10 @@
 //!
 //!   usbwire-client pair  --server HOST:PORT --code XXXXX-XXXXX    once per server
 //!   usbwire-client list  --server HOST:PORT
-//!   usbwire-client serve --server HOST:PORT --dev VID:PID [--listen 127.0.0.1:3240]
-//!       then: usbip attach -r 127.0.0.1 -b 1-1   (Linux)  /  usbip.exe attach ... (usbip-win2)
+//!   usbwire-client serve --server HOST:PORT --dev VID:PID [--listen 127.0.0.1:3240] [--attach]
+//!       (with --attach and no --listen the adapter takes any free local port)
+//!       then: usbip attach -r 127.0.0.1 -b 1-1 (Linux, or usbip-win2 usbip.exe on Windows);
+//!       --attach runs that for you
 //!   usbwire-client bench --server HOST:PORT --dev VID:PID [-n 200]
 //!       plays the part of vhci against the local adapter and times FIDO round trips
 //!
@@ -33,13 +35,16 @@ struct Args {
     cert: Option<PathBuf>,
     code: String,
     dev: Option<(u16, u16)>,
-    listen: String,
+    /// Adapter address; default 127.0.0.1:3240, or any free port with --attach.
+    listen: Option<String>,
     rounds: usize,
     caps: Capabilities,
+    /// serve: run `usbip attach` against our own adapter once it listens.
+    auto_attach: bool,
 }
 
 const USAGE: &str = "usage: usbwire-client <pair|list|serve|bench> --server HOST:PORT [--code CODE] [--dev VID:PID] \
-[--listen ADDR] [-n N] [--state DIR] [--cert FILE] [--no-early-ack] [--no-push] [--no-desc-cache]";
+[--listen ADDR] [--attach] [-n N] [--state DIR] [--cert FILE] [--no-early-ack] [--no-push] [--no-desc-cache]";
 
 fn default_state() -> PathBuf {
     if let Ok(d) = std::env::var("USBWIRE_CLIENT_STATE") {
@@ -69,9 +74,10 @@ fn parse_args() -> Result<Args> {
         cert: None,
         code: String::new(),
         dev: None,
-        listen: "127.0.0.1:3240".into(),
+        listen: None,
         rounds: 200,
         caps: Capabilities { interrupt_in_push: true, early_out_ack: true, descriptor_cache: true },
+        auto_attach: false,
     };
     while let Some(arg) = it.next() {
         let mut val = || it.next().with_context(|| format!("{arg} needs a value"));
@@ -80,8 +86,9 @@ fn parse_args() -> Result<Args> {
             "--cert" => a.cert = Some(val()?.into()),
             "--state" => a.state = val()?.into(),
             "--code" => a.code = val()?,
-            "--listen" => a.listen = val()?,
+            "--listen" => a.listen = Some(val()?),
             "-n" => a.rounds = val()?.parse()?,
+            "--attach" => a.auto_attach = true,
             "--no-early-ack" => a.caps.early_out_ack = false,
             "--no-push" => a.caps.interrupt_in_push = false,
             "--no-desc-cache" => a.caps.descriptor_cache = false,
@@ -144,20 +151,34 @@ async fn run(args: &Args, remote: &Arc<Remote>) -> Result<()> {
         "list" => {
             for d in remote.list().await? {
                 println!(
-                    "dev {}  {:04x}:{:04x}  {:?}  {} {}",
+                    "dev {}  {:04x}:{:04x}  {:?}  {} {}{}",
                     d.dev,
                     d.vid,
                     d.pid,
                     d.speed,
                     d.manufacturer.as_deref().unwrap_or(""),
-                    d.product.as_deref().unwrap_or("")
+                    d.product.as_deref().unwrap_or(""),
+                    if d.busy { "  (in use)" } else { "" }
                 );
             }
             Ok(())
         }
         "serve" => {
+            // We tell usbip the port ourselves with --attach, so any free one
+            // will do (3240 is often taken, e.g. by usbipd-win on Windows).
+            let default = if args.auto_attach { "127.0.0.1:0" } else { "127.0.0.1:3240" };
+            let addr = args.listen.as_deref().unwrap_or(default);
+            // Bind first: failing here must not cost the server a driver swap.
+            let listener = TcpListener::bind(addr).await.with_context(|| format!("listening on {addr}"))?;
             let attach = attach(remote, args.dev).await?;
-            let listener = TcpListener::bind(&args.listen).await?;
+            if args.auto_attach {
+                let port = listener.local_addr()?.port();
+                tokio::spawn(async move {
+                    if let Err(e) = usbip_attach(port).await {
+                        tracing::error!("usbip attach: {e:#}");
+                    }
+                });
+            }
             tokio::select! {
                 r = Adapter::new(remote.clone(), attach).serve(listener) => r,
                 _ = shutdown_signal() => Ok(()),
@@ -175,7 +196,43 @@ async fn run(args: &Args, remote: &Arc<Remote>) -> Result<()> {
     }
 }
 
-/// Ctrl-C, or SIGTERM on Unix: either way we fall through to a clean QUIC
+/// The OS's USB/IP tool: usbip-win2's usbip.exe on Windows, usbip on Linux.
+fn usbip_tool() -> PathBuf {
+    #[cfg(windows)]
+    {
+        let installed = PathBuf::from(std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".into()))
+            .join("USBip")
+            .join("usbip.exe");
+        if installed.exists() {
+            return installed;
+        }
+    }
+    "usbip".into()
+}
+
+/// Attach our adapter's device to the OS (vhci_hcd / usbip-win2). The
+/// attachment ends by itself when the adapter connection closes.
+async fn usbip_attach(port: u16) -> Result<()> {
+    let tool = usbip_tool();
+    let mut cmd = tokio::process::Command::new(&tool);
+    if port != 3240 {
+        cmd.args(["--tcp-port", &port.to_string()]);
+    }
+    cmd.args(["attach", "-r", "127.0.0.1", "-b", usbip::BUSID]);
+    // usbip-win2 keeps re-attaching after the connection drops unless told
+    // not to; the attachment should end with this client.
+    #[cfg(windows)]
+    cmd.arg("--once");
+    let out = cmd.output().await.with_context(|| format!("running {}", tool.display()))?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string() + String::from_utf8_lossy(&out.stderr).trim();
+    if !out.status.success() {
+        bail!("{} failed ({}): {text}", tool.display(), out.status);
+    }
+    tracing::info!("attached to the local USB/IP driver{}", if text.is_empty() { String::new() } else { format!(": {text}") });
+    Ok(())
+}
+
+/// Ctrl-C, SIGTERM on Unix, closing the console window on Windows: either way we fall through to a clean QUIC
 /// close so the server releases the device immediately.
 async fn shutdown_signal() {
     #[cfg(unix)]
@@ -187,8 +244,16 @@ async fn shutdown_signal() {
             _ = term.recv() => {}
         }
     }
-    #[cfg(not(unix))]
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows::{ctrl_close, ctrl_shutdown};
+        let (mut close, mut shutdown) = (ctrl_close().expect("console close handler"), ctrl_shutdown().expect("shutdown handler"));
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = close.recv() => {}
+            _ = shutdown.recv() => {}
+        }
+    }
 }
 
 async fn attach(remote: &Remote, want: Option<(u16, u16)>) -> Result<AttachOk> {
@@ -310,6 +375,7 @@ async fn bench(remote: &Remote, a: &AttachOk, adapter: std::net::SocketAddr, rou
 
     let mut init = Vec::new();
     let mut cid = [0xff; 4];
+    let mut stale = 0usize;
     for round in 0..rounds {
         let nonce = (round as u64 ^ 0x1122_3344_5566_0000).to_be_bytes();
         let mut pkt = [0u8; 64];
@@ -319,29 +385,37 @@ async fn bench(remote: &Remote, a: &AttachOk, adapter: std::net::SocketAddr, rou
         pkt[7..15].copy_from_slice(&nonce);
 
         let t = Instant::now();
-        let in_seq = v.submit(ep_in, true, 64, [0; 8], &[]).await?;
+        let mut in_seq = v.submit(ep_in, true, 64, [0; 8], &[]).await?;
         let out_seq = v.submit(ep_out, false, 64, [0; 8], &pkt).await?;
         let mut got_in = None;
         let mut got_out = false;
         while got_in.is_none() || !got_out {
-            let (cmd, seq, status, data) = v.reply(|s| s == in_seq).await?;
+            let cur_in = in_seq;
+            let (cmd, seq, status, data) = v.reply(|s| s == cur_in).await?;
             if cmd != usbip::RET_SUBMIT || status != 0 {
                 bail!("transfer failed: cmd {cmd} seq {seq} status {status}");
             }
             if seq == in_seq {
-                got_in = Some(data);
+                if data.len() >= 15 && data[4] == 0x86 && data[7..15] == nonce {
+                    got_in = Some(data);
+                } else {
+                    // Not our reply (e.g. the rest of a message an earlier session
+                    // abandoned): skip it, as libfido2 does.
+                    stale += 1;
+                    in_seq = v.submit(ep_in, true, 64, [0; 8], &[]).await?;
+                }
             } else if seq == out_seq {
                 got_out = true;
             }
         }
         let data = got_in.unwrap();
-        if data.len() < 15 || data[4] != 0x86 || data[7..15] != nonce {
-            bail!("unexpected CTAPHID reply {data:02x?}");
-        }
         cid.copy_from_slice(&data[15..19]);
         init.push(t.elapsed());
     }
     stats("FIDO CTAPHID_INIT (OUT+IN)", init);
+    if stale > 0 {
+        println!("(skipped {stale} stale reports left in the key by an earlier session)");
+    }
 
     // Unlink: park an IN transfer (the key has nothing to say) and cancel it,
     // as usbhid does on close.

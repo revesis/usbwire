@@ -49,7 +49,11 @@ fn main() {
 fn list() -> Result<()> {
     for d in nusb::list_devices().wait()? {
         #[cfg(windows)]
-        let extra = format!("driver={:<10} {}", d.driver().unwrap_or("-"), d.instance_id().to_string_lossy());
+        let extra = {
+            let inst = d.instance_id().to_string_lossy();
+            let remote = if swap::is_usbip_virtual(&inst) { " [usbip]" } else { "" };
+            format!("driver={:<10} {inst}{remote}", d.driver().unwrap_or("-"))
+        };
         #[cfg(not(windows))]
         let extra = String::new();
         println!(

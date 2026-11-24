@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/proto", "crates/net", "crates/server", "crates/client", "crates/winswap", "crates/udpdelay"]
+members = ["crates/proto", "crates/net", "crates/server", "crates/client", "crates/winswap", "crates/udpdelay", "crates/fidoping"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,7 +13,7 @@ postcard = { version = "1", features = ["use-std"] }
 bytes = "1"
 thiserror = "2"
 anyhow = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "process"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 tracing = "0.1"

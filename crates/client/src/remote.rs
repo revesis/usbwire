@@ -20,7 +20,7 @@ use usbwire_proto::{
 #[derive(Debug)]
 pub enum EpEvent {
     Complete(Complete),
-    Push { ep: u8, epoch: UrbId, data: Vec<u8> },
+    Push { ep: u8, data: Vec<u8> },
     Deferred { ep: u8, urb: UrbId, status: Status },
 }
 
@@ -186,7 +186,7 @@ impl EpStreams {
                 loop {
                     let ev = match rx.next::<EpMsg>().await {
                         Ok(Some(EpMsg::Complete(c))) => EpEvent::Complete(c),
-                        Ok(Some(EpMsg::Push { epoch, data })) => EpEvent::Push { ep, epoch, data },
+                        Ok(Some(EpMsg::Push { data, .. })) => EpEvent::Push { ep, data },
                         Ok(Some(EpMsg::DeferredError { urb, status })) => EpEvent::Deferred { ep, urb, status },
                         Ok(Some(other)) => {
                             debug!(ep, "ignoring {other:?}");

@@ -267,6 +267,13 @@ pub async fn run_data(
     }
 }
 
+/// Keep PUSH_DEPTH reads pending on a push endpoint.
+fn top_up(ep: &mut Ep, mps: usize) {
+    for _ in ep.pending()..PUSH_DEPTH {
+        ep.submit(Buffer::new(mps));
+    }
+}
+
 /// Push mode for an interrupt IN endpoint: read reports continuously while the
 /// client has the endpoint open and stream them without waiting to be asked.
 /// A Submit (re)starts polling; a Cancel stops it.
@@ -278,6 +285,10 @@ async fn run_push(
 ) -> Result<()> {
     let mps = ep.max_packet();
     let mut epoch: Option<UrbId> = None;
+    // Reports read after the client stopped polling (reads already in flight
+    // when the Cancel came). They are gone from the device, so they must reach
+    // the client: send them first when polling restarts.
+    let mut held: VecDeque<Vec<u8>> = VecDeque::new();
     loop {
         let ev = poll_fn(|cx| {
             if ep.pending() > 0
@@ -298,10 +309,12 @@ async fn run_push(
                 if epoch.is_none() {
                     debug!(ep = addr, epoch = s.urb, "push: start polling");
                     epoch = Some(s.urb);
-                    // Leftover cancelled reads still count as pending; top up only.
-                    for _ in ep.pending()..PUSH_DEPTH {
-                        ep.submit(Buffer::new(mps));
+                    for data in held.drain(..) {
+                        send(&mut tx, &EpMsg::Push { epoch: s.urb, data }).await?;
                     }
+                    // Cancelled reads that have not completed yet still count as
+                    // pending; they are replaced as they complete (see below).
+                    top_up(&mut ep, mps);
                 }
             }
             Event::Msg(Some(EpMsg::Cancel { .. })) => {
@@ -312,16 +325,28 @@ async fn run_push(
             }
             Event::Msg(Some(other)) => warn!("unexpected message on push endpoint: {other:?}"),
             Event::Done(c) => {
-                let Some(e) = epoch else { continue }; // stopped: drop leftovers
+                let Some(e) = epoch else {
+                    if c.status.is_ok() {
+                        let mut data = c.buffer.into_vec();
+                        data.truncate(c.actual_len);
+                        debug!(ep = addr, len = data.len(), "push: holding a report read after stop");
+                        held.push_back(data);
+                    }
+                    continue;
+                };
                 match c.status {
                     Ok(()) => {
                         let mut data = c.buffer.into_vec();
                         data.truncate(c.actual_len);
                         debug!(ep = addr, len = data.len(), "push");
                         send(&mut tx, &EpMsg::Push { epoch: e, data }).await?;
-                        ep.submit(Buffer::new(mps));
+                        top_up(&mut ep, mps);
                     }
-                    Err(nusb::transfer::TransferError::Cancelled) => {}
+                    // A read cancelled by an earlier stop that only completes now,
+                    // after polling restarted: the restart could not replace it
+                    // then (it still counted as pending), so replace it now, or
+                    // the device would be left with no reads at all.
+                    Err(nusb::transfer::TransferError::Cancelled) => top_up(&mut ep, mps),
                     Err(err) => {
                         warn!(ep = addr, "push: read failed: {err}; stopping");
                         epoch = None;

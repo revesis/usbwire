@@ -299,3 +299,35 @@ pub fn journal_entries() -> Vec<String> {
 pub fn current_service(inst: &str) -> Option<String> {
     Dev::open(inst).ok().and_then(|d| d.prop(SPDRP_SERVICE))
 }
+
+/// Instance ids of a device's ancestors, nearest first, up to the root.
+pub fn ancestors(inst: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    unsafe {
+        let mut node = 0u32;
+        if CM_Locate_DevNodeW(&mut node, wide(inst).as_ptr(), CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS {
+            return out;
+        }
+        let mut parent = 0u32;
+        while CM_Get_Parent(&mut parent, node, 0) == CR_SUCCESS {
+            let mut buf = [0u16; 512];
+            if CM_Get_Device_IDW(parent, buf.as_mut_ptr(), buf.len() as u32, 0) != CR_SUCCESS {
+                break;
+            }
+            out.push(from_wide(&buf));
+            node = parent;
+        }
+    }
+    out
+}
+
+/// True if the device hangs off a USB/IP virtual host controller
+/// (usbip-win2), i.e. it is a remote device attached to this machine. The
+/// server must never export or swap those: it would loop a device back
+/// through itself.
+pub fn is_usbip_virtual(inst: &str) -> bool {
+    ancestors(inst).iter().any(|a| {
+        a.to_ascii_lowercase().contains("usbip")
+            || current_service(a).is_some_and(|s| s.to_ascii_lowercase().contains("usbip"))
+    })
+}
