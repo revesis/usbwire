@@ -1,13 +1,15 @@
 # usbwire
 
-Use a USB security key (YubiKey, other FIDO/HID dongles) plugged into one
-machine from another machine, over the internet.
+Use a USB device plugged into one machine from another, over a LAN or the
+internet — a USB security key (YubiKey, other FIDO/HID dongles), or a CDC-ACM
+serial device such as a Proxmark3.
 
 usbwire is USB/IP rebuilt for latency over WAN. It uses QUIC instead of
 TCP, its own protocol between server and client, and mutual TLS with
-one-time-code pairing. The client presents the device to the operating
-system's own USB/IP driver, so applications (browsers, `libfido2`, `ssh`,
-`gpg`) see an ordinary local key.
+one-time-code (or trusted-LAN) pairing. The client presents the device to the
+operating system's own USB/IP driver, so applications (browsers, `libfido2`,
+`ssh`, `gpg`, or a serial client on `/dev/ttyACM*`) see an ordinary local
+device.
 
 ```
  Windows server                                   Client (Linux or Windows)
@@ -15,7 +17,7 @@ system's own USB/IP driver, so applications (browsers, `libfido2`, `ssh`,
  │ YubiKey ── WinUSB        │◄═══════════════════►│ usbwire-client serve         │
  │ usbwire-server (service) │  mTLS, paired certs │   └─ USB/IP on 127.0.0.1     │
  └──────────────────────────┘                     │ vhci_hcd / usbip-win2 driver │
-                                                  │   └─ an ordinary local key   │
+                                                  │   └─ an ordinary local device│
                                                   └──────────────────────────────┘
 ```
 
@@ -23,7 +25,7 @@ system's own USB/IP driver, so applications (browsers, `libfido2`, `ssh`,
 |---|---|
 | Server | Windows 10/11 (also runs on Linux for development) |
 | Client | Linux (vhci_hcd) and Windows 10/11 ([usbip-win2](https://github.com/vadimgrn/usbip-win2) driver). macOS later |
-| Devices | Exports Yubico devices (VID `1050`) by default; configurable |
+| Devices | FIDO/HID keys and CDC-ACM serial devices. Exports Yubico (VID `1050`) by default; set `export` to add others (e.g. a Proxmark3 `9ac4:4b8f`) |
 
 ## Why not plain USB/IP?
 
@@ -119,6 +121,10 @@ Each swap is recorded in a journal
 device is swapped, it restores the device on its next start. Stopping the
 service also restores every swapped device.
 
+For a serial (COM-port) device, the server records its `PortName` before the
+swap and writes it back on restore, so the device keeps the same `COMx` across
+export/restore cycles instead of being renumbered each time.
+
 ## Build
 
 The workspace uses Rust edition 2024, so it needs Rust 1.85 or newer.
@@ -180,6 +186,13 @@ usbwire-client pair --server SERVER_HOST:7443 --code 7K3QD-M9XAB
 Check that the server key fingerprint printed on the client matches the one
 on the server.
 
+**Trusted LAN (skip the code).** On a network you control, set
+`trusted_subnets` in the server config (e.g. `["192.168.0.0/24"]`) and run the
+client with `serve --trust-server`: it learns and pins the server certificate
+on first connect and is enrolled automatically — no pairing code, no edit on
+the server. mTLS and certificate pinning still apply; each enrolment is logged
+to `audit.log`.
+
 ### 3a. Use the key: Linux client
 
 ```sh
@@ -191,7 +204,12 @@ fido2-token -L       # the remote key is now a local /dev/hidrawN
 
 `--attach` runs `usbip attach` for you once the adapter listens. Without it,
 the adapter listens on 127.0.0.1:3240 and you run
-`sudo usbip attach -r 127.0.0.1 -b 1-1` yourself.
+`sudo usbip attach -r 127.0.0.1 -b 1-1` yourself. (`usbip` comes from
+`linux-tools-<kernel>`; install the package matching `uname -r`.)
+
+For a CDC-ACM serial device, pass its own `--dev VID:PID` (a Proxmark3 is
+`9ac4:4b8f`). It appears as `/dev/ttyACM*` on Linux or a COM port on Windows,
+and an ordinary serial client uses it directly.
 
 ### 3b. Use the key: Windows client
 
