@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use tracing::{info, warn};
 use usbwire_net::auth::{self, Pairing};
 use usbwire_net::{FrameReader, quinn, send};
-use usbwire_proto::{Capabilities, Control, EpOpen, ErrorCode, PROTOCOL_VERSION};
+use usbwire_proto::{Capabilities, Control, EpOpen, ErrorCode, PROTOCOL_VERSION, XferType};
 
 use crate::device::{OpenDevice, Refused, Registry, recover_from_journal};
 use crate::endpoint;
@@ -96,6 +96,31 @@ fn error(code: ErrorCode, message: impl Into<String>) -> Control {
 }
 
 impl Server {
+    /// Trusted-LAN auto-pairing: if `remote` is in a configured trusted subnet,
+    /// enroll this fingerprint (allow list = `export`) and return the new client.
+    /// Returns `Ok(None)` when auto-pairing is off or the address is not trusted.
+    fn auto_enroll(&self, fingerprint: &str, client_name: &str, remote: SocketAddr) -> Result<Option<state::Client>> {
+        let cfg = self.state.config()?;
+        if cfg.trusted_subnets.is_empty() || !state::any_subnet_matches(&cfg.trusted_subnets, remote.ip()) {
+            return Ok(None);
+        }
+        let client = state::Client {
+            fingerprint: fingerprint.to_string(),
+            name: format!("auto-{}", remote.ip()),
+            allow: cfg.export.clone(),
+            paired_at: state::timestamp(),
+        };
+        self.state.add_client(client.clone())?;
+        self.state.audit(&format!(
+            "auto-paired client fp={} name={:?} from trusted {remote} allow={:?}",
+            auth::short_fp(fingerprint),
+            client_name,
+            client.allow
+        ));
+        info!(name = %client.name, %remote, "auto-paired client from trusted subnet");
+        Ok(Some(client))
+    }
+
     /// Close sessions of clients that are no longer paired.
     fn close_revoked(&self) {
         let clients = match self.state.clients() {
@@ -141,17 +166,25 @@ impl Server {
                     send(&mut ctl_tx, &error(ErrorCode::VersionMismatch, msg)).await?;
                     bail!("version mismatch");
                 }
-                let Some(client) = self.state.client(&client_fp)? else {
-                    self.state.audit(&format!(
-                        "rejected unpaired client fp={} name={:?} from {remote}",
-                        auth::short_fp(&client_fp),
-                        h.client_name
-                    ));
-                    let msg = "this client is not paired with the server: run `usbwire-server pair` on the server, then `usbwire-client pair` here";
-                    send(&mut ctl_tx, &error(ErrorCode::NotPaired, msg)).await?;
-                    let _ = ctl_tx.finish();
-                    let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
-                    bail!("unpaired client {}", auth::short_fp(&client_fp));
+                let client = match self.state.client(&client_fp)? {
+                    Some(c) => c,
+                    // Trusted-LAN auto-pairing: enroll a new client from a trusted
+                    // subnet instead of refusing it. mTLS and cert pinning still hold.
+                    None => match self.auto_enroll(&client_fp, &h.client_name, remote)? {
+                        Some(c) => c,
+                        None => {
+                            self.state.audit(&format!(
+                                "rejected unpaired client fp={} name={:?} from {remote}",
+                                auth::short_fp(&client_fp),
+                                h.client_name
+                            ));
+                            let msg = "this client is not paired with the server: run `usbwire-server pair` on the server, then `usbwire-client pair` here";
+                            send(&mut ctl_tx, &error(ErrorCode::NotPaired, msg)).await?;
+                            let _ = ctl_tx.finish();
+                            let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
+                            bail!("unpaired client {}", auth::short_fp(&client_fp));
+                        }
+                    },
                 };
                 info!(client = %client.name, caps = ?h.caps, "hello");
                 send(&mut ctl_tx, &Control::HelloOk { version: PROTOCOL_VERSION, server_name: hostname() }).await?;
@@ -290,7 +323,17 @@ async fn handle_endpoint_stream(
     if open.ep == 0 {
         endpoint::run_control(dev, tx, rx).await
     } else {
-        endpoint::run_data(dev, open.ep, caps.interrupt_in_push, tx, rx).await
+        // Run this IN endpoint in push mode? Interrupt IN always; bulk IN only
+        // for CDC-ACM stream endpoints the client agreed to.
+        let push = dev.endpoints.get(&open.ep).is_some_and(|e| {
+            e.address & 0x80 != 0
+                && match e.xfer {
+                    XferType::Interrupt => caps.interrupt_in_push,
+                    XferType::Bulk => caps.bulk_in_push && e.stream,
+                    _ => false,
+                }
+        });
+        endpoint::run_data(dev, open.ep, push, tx, rx).await
     }
 }
 

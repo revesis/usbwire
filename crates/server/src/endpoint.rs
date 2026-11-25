@@ -261,7 +261,10 @@ pub async fn run_data(
         }
     });
 
-    if push && matches!(ep, Ep::IntIn(_)) {
+    // `push` is decided per endpoint by the caller (interrupt IN always; bulk IN
+    // only for CDC-ACM stream endpoints). run_push reads mps-sized buffers, which
+    // suits bulk IN as well.
+    if push && ep.is_in() {
         return run_push(ep, addr, tx, msg_rx, halt_rx).await;
     }
 

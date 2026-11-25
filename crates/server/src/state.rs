@@ -47,6 +47,12 @@ pub struct Config {
     pub restore_on_release: bool,
     /// Seconds to wait before restoring, so a quick reconnect doesn't churn drivers.
     pub restore_delay_secs: u64,
+    /// Trusted-LAN auto-pairing: IPv4 CIDRs (e.g. "192.168.92.0/24") from which a
+    /// new client is enrolled on first connect instead of needing a pairing code.
+    /// It still uses mTLS and pins the server cert; it is granted `export` as its
+    /// allow list. Empty (default) disables this — pairing is required. Keep it to
+    /// subnets you fully trust: anyone on them can attach your exported devices.
+    pub trusted_subnets: Vec<String>,
 }
 
 impl Default for Config {
@@ -57,8 +63,37 @@ impl Default for Config {
             export: vec!["1050:*".into()],
             restore_on_release: true,
             restore_delay_secs: 5,
+            trusted_subnets: Vec::new(),
         }
     }
+}
+
+/// Is `ip` inside the IPv4 CIDR `cidr` (e.g. "192.168.92.0/24")? IPv4-mapped
+/// IPv6 (`::ffff:a.b.c.d`) is matched on its IPv4 part; other inputs are false.
+pub fn subnet_matches(cidr: &str, ip: std::net::IpAddr) -> bool {
+    let v4 = match ip {
+        std::net::IpAddr::V4(a) => a,
+        std::net::IpAddr::V6(a) => match a.to_ipv4_mapped() {
+            Some(a) => a,
+            None => return false,
+        },
+    };
+    let (net, bits) = match cidr.trim().split_once('/') {
+        Some((n, b)) => (n, b),
+        None => return false,
+    };
+    let (Ok(net), Ok(bits)) = (net.parse::<std::net::Ipv4Addr>(), bits.parse::<u8>()) else {
+        return false;
+    };
+    if bits > 32 {
+        return false;
+    }
+    let mask: u32 = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+    (u32::from(v4) & mask) == (u32::from(net) & mask)
+}
+
+pub fn any_subnet_matches(cidrs: &[String], ip: std::net::IpAddr) -> bool {
+    cidrs.iter().any(|c| subnet_matches(c, ip))
 }
 
 /// "VID:PID", "VID:*" or "*", hex, case-insensitive.
@@ -228,6 +263,21 @@ mod tests {
         assert!(!selector_matches("1050:0407", 0x1050, 0x0406));
         assert!(!selector_matches("1050", 0x1050, 0x0407));
         assert!(!selector_matches("zzzz:*", 0x1050, 0x0407));
+    }
+
+    #[test]
+    fn subnets() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert!(subnet_matches("192.168.92.0/24", ip("192.168.92.26")));
+        assert!(subnet_matches(" 192.168.92.0/24 ", ip("192.168.92.1")));
+        assert!(!subnet_matches("192.168.92.0/24", ip("192.168.93.26")));
+        assert!(subnet_matches("10.0.0.0/8", ip("10.40.11.44")));
+        assert!(subnet_matches("0.0.0.0/0", ip("8.8.8.8")));
+        assert!(subnet_matches("192.168.92.0/24", ip("::ffff:192.168.92.26")));
+        assert!(!subnet_matches("192.168.92.0/24", ip("fe80::1")));
+        assert!(!subnet_matches("garbage", ip("192.168.92.26")));
+        assert!(!subnet_matches("192.168.92.0/33", ip("192.168.92.26")));
+        assert!(any_subnet_matches(&["10.0.0.0/8".into(), "192.168.92.0/24".into()], ip("192.168.92.5")));
     }
 
     #[test]

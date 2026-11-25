@@ -266,12 +266,14 @@ revoked client's open sessions within about 2 seconds (logged in
 ```
 usbwire-client pair  --server HOST:PORT --code CODE
 usbwire-client list  --server HOST:PORT
-usbwire-client serve --server HOST:PORT --dev VID:PID [--listen ADDR] [--attach] [--no-reconnect]
+usbwire-client serve --server HOST:PORT --dev VID:PID [--listen ADDR] [--attach] [--no-reconnect] [--trust-server]
 usbwire-client bench --server HOST:PORT --dev VID:PID [-n 200]
 usbwire-client service install <serve options>       (Windows, as Administrator)
 usbwire-client service uninstall
 options: --state DIR  --cert FILE
-         --no-early-ack  --no-push  --no-desc-cache   (turn off one optimisation, for comparison)
+         --no-early-ack  --no-push  --no-desc-cache   (turn off one optimisation)
+         --bulk-stream    experimental: push/early-ack bulk on CDC-ACM (breaks PM3; off by default)
+         --trust-server   learn and pin the server cert on first use (trusted LAN; skips pairing)
 ```
 
 The client's state is in `~/.config/usbwire` (Linux) or `%APPDATA%\usbwire`
@@ -287,11 +289,26 @@ Windows):
   "listen": "0.0.0.0:7443",
   "export": ["1050:*"],
   "restore_on_release": true,
-  "restore_delay_secs": 5
+  "restore_delay_secs": 5,
+  "trusted_subnets": []
 }
 ```
 
 Selectors are hex `VID:PID`, `VID:*` or `*`.
+
+`trusted_subnets` (default empty) lists IPv4 CIDRs, e.g. `["192.168.92.0/24"]`,
+from which a new client is **auto-paired** on first connect instead of needing a
+one-time code: a client there just runs `serve --trust-server` and is enrolled
+(granted the `export` list, logged to `audit.log`). mTLS and server-cert pinning
+still apply; only the interactive pairing step is skipped. Leave it empty to
+require `pair`. Anyone on a trusted subnet can attach your exported devices, so
+list only subnets you fully control.
+
+Bulk push / early-ack for CDC-ACM serial endpoints exists behind `--bulk-stream`
+(the server marks CDC data-interface endpoints, class 0x0A, as `stream`). It is
+**experimental and off by default**: on a Proxmark3 it breaks the CDC request/
+response framing, and it brings no benefit on a LAN. It is kept for future WAN
+work on serial devices.
 
 The server state directory holds:
 

@@ -15,7 +15,10 @@ use std::process::Command;
 use std::ptr::{addr_of, null, null_mut};
 
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::*;
-use windows_sys::Win32::Foundation::{ERROR_NO_MORE_ITEMS, GetLastError};
+use windows_sys::Win32::Foundation::{ERROR_NO_MORE_ITEMS, GetLastError, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::System::Registry::{
+    HKEY, KEY_READ, KEY_SET_VALUE, REG_SZ, RegCloseKey, RegQueryValueExW, RegSetValueExW,
+};
 
 use tracing::{info, warn};
 
@@ -91,6 +94,64 @@ impl Dev {
             )
         };
         (ok != 0).then(|| from_wide(&buf))
+    }
+
+    /// The device's serial `PortName` (e.g. "COM3"), if it is a COM-port device.
+    /// usbser stores it under the device's hardware key (DIREG_DEV); a WinUSB
+    /// device has none. Read it while the device is still a serial port so the
+    /// same COM number can be reapplied after a restore (which recreates the
+    /// node and would otherwise let usbser claim the next free number).
+    fn port_name(&self) -> Option<String> {
+        unsafe {
+            let key: HKEY =
+                SetupDiOpenDevRegKey(self.set, &self.data, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_READ);
+            if key.is_null() || key == INVALID_HANDLE_VALUE {
+                return None;
+            }
+            let mut buf = [0u16; 64];
+            let mut len = (buf.len() * 2) as u32;
+            let r = RegQueryValueExW(
+                key,
+                wide("PortName").as_ptr(),
+                null_mut(),
+                null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut len,
+            );
+            RegCloseKey(key);
+            (r == 0).then(|| from_wide(&buf)).filter(|s| !s.is_empty())
+        }
+    }
+
+    /// Write the device's `PortName` back, so usbser reuses this COM number.
+    fn set_port_name(&self, port: &str) -> Result<()> {
+        unsafe {
+            let key: HKEY = SetupDiOpenDevRegKey(
+                self.set,
+                &self.data,
+                DICS_FLAG_GLOBAL,
+                0,
+                DIREG_DEV,
+                KEY_SET_VALUE,
+            );
+            if key.is_null() || key == INVALID_HANDLE_VALUE {
+                return Err(last_error("SetupDiOpenDevRegKey(DIREG_DEV, write)"));
+            }
+            let val = wide(port); // NUL-terminated UTF-16
+            let r = RegSetValueExW(
+                key,
+                wide("PortName").as_ptr(),
+                0,
+                REG_SZ,
+                val.as_ptr().cast(),
+                (val.len() * 2) as u32,
+            );
+            RegCloseKey(key);
+            if r != 0 {
+                return Err(format!("RegSetValueExW(PortName={port}) failed: {r}").into());
+            }
+            Ok(())
+        }
     }
 
     fn set_class_guid(&mut self, guid: &str) -> Result<()> {
@@ -220,7 +281,10 @@ pub fn export(inst: &str) -> Result<()> {
     let service = dev.prop(SPDRP_SERVICE).unwrap_or_default();
     let class = dev.prop(SPDRP_CLASSGUID).unwrap_or_default();
     let desc = dev.prop(SPDRP_DEVICEDESC).unwrap_or_default();
-    info!("{inst}: {desc:?} service={service} class={class}");
+    // Serial COM port, if any: saved so restore can reapply it instead of letting
+    // usbser pick the next free number and make the COM climb on every swap.
+    let port = dev.port_name().unwrap_or_default();
+    info!("{inst}: {desc:?} service={service} class={class} port={port:?}");
     if service.eq_ignore_ascii_case("winusb") {
         info!("already bound to WinUSB");
         return Ok(());
@@ -229,7 +293,7 @@ pub fn export(inst: &str) -> Result<()> {
     // Journal first, so a crash mid-swap can still be restored.
     let jp = journal_path();
     fs::create_dir_all(jp.parent().unwrap())?;
-    writeln!(OpenOptions::new().create(true).append(true).open(&jp)?, "{inst}\t{service}\t{class}")?;
+    writeln!(OpenOptions::new().create(true).append(true).open(&jp)?, "{inst}\t{service}\t{class}\t{port}")?;
     info!("journal: {}", jp.display());
 
     info!("attempt 1: winusb.inf class list as-is");
@@ -251,6 +315,9 @@ pub fn export(inst: &str) -> Result<()> {
 pub fn restore(inst: &str) -> Result<()> {
     let before = Dev::open(inst).ok().and_then(|d| d.prop(SPDRP_SERVICE));
     info!("{inst}: service before restore = {before:?}");
+    // The COM port saved at export: /remove-device deletes the node (PortName and
+    // all), so reapply it afterwards instead of letting usbser pick a new number.
+    let saved_port = journal_port(inst);
     run("pnputil", &["/remove-device", inst])?;
     run("pnputil", &["/scan-devices"])?;
 
@@ -264,6 +331,21 @@ pub fn restore(inst: &str) -> Result<()> {
         }
     }
     info!("restored: service is now {after:?}");
+
+    // Reapply the original COM number so it stays stable across swaps.
+    if let Some(port) = saved_port.filter(|p| !p.is_empty())
+        && after.as_deref().is_some_and(|s| !s.eq_ignore_ascii_case("winusb"))
+    {
+        match Dev::open(inst).and_then(|d| d.set_port_name(&port)) {
+            Ok(()) => {
+                info!("reapplied COM port {port}; restarting the device to take effect");
+                if let Err(e) = run("pnputil", &["/restart-device", inst]) {
+                    warn!("restart-device after setting {port}: {e}");
+                }
+            }
+            Err(e) => warn!("could not reapply COM port {port}: {e}"),
+        }
+    }
 
     let jp = journal_path();
     if let Ok(text) = fs::read_to_string(&jp) {
@@ -293,6 +375,16 @@ pub fn journal_entries() -> Vec<String> {
     fs::read_to_string(journal_path())
         .map(|t| t.lines().filter_map(|l| l.split('\t').next()).filter(|s| !s.is_empty()).map(String::from).collect())
         .unwrap_or_default()
+}
+
+/// The serial COM port recorded for `inst` in the swap journal (column 4), if any.
+fn journal_port(inst: &str) -> Option<String> {
+    let text = fs::read_to_string(journal_path()).ok()?;
+    text.lines()
+        .find(|l| l.split('\t').next().unwrap_or("").eq_ignore_ascii_case(inst))
+        .and_then(|l| l.split('\t').nth(3))
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
 }
 
 /// The driver service currently bound to a device node, if it is present.

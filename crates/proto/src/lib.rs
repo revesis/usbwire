@@ -14,7 +14,9 @@ pub mod frame;
 use serde::{Deserialize, Serialize};
 
 /// Protocol version; bump on any incompatible change.
-pub const PROTOCOL_VERSION: u16 = 1;
+/// v2: `Capabilities` gained bulk_in_push/bulk_out_ack; `EndpointInfo` gained
+/// `stream`. Postcard is not self-describing, so server and client must match.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Server-local device handle, valid for the lifetime of one plug-in.
 pub type DevId = u32;
@@ -68,6 +70,12 @@ pub struct Capabilities {
     pub early_out_ack: bool,
     /// Client answers standard GET_DESCRIPTOR requests from the snapshot.
     pub descriptor_cache: bool,
+    /// Like `interrupt_in_push`, but for bulk IN endpoints. Only safe for
+    /// stream-shaped endpoints (CDC-ACM serial), so the server enables it in
+    /// `AttachOk` only for such devices, and only on endpoints it marks `stream`.
+    pub bulk_in_push: bool,
+    /// Like `early_out_ack`, but for bulk OUT endpoints; same CDC-ACM gating.
+    pub bulk_out_ack: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +143,9 @@ pub struct EndpointInfo {
     pub xfer: XferType,
     pub max_packet: u16,
     pub interval: u8,
+    /// Stream-shaped endpoint (on a CDC-ACM interface): safe to run bulk IN in
+    /// push mode and to early-ack bulk OUT. Set by the server at attach.
+    pub stream: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

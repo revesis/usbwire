@@ -119,6 +119,18 @@ pub async fn pair(server: &str, identity: usbwire_net::Identity, code: &str) -> 
     result
 }
 
+/// Trust-on-first-use: learn a server's certificate by completing one TLS
+/// handshake, so a trusted-LAN client can connect without a prior pairing. The
+/// server still authorizes the client (auto-pairing, if it trusts the subnet).
+pub async fn fetch_server_cert(server: &str, identity: usbwire_net::Identity) -> Result<CertificateDer<'static>> {
+    let verifier = ServerCert::for_pairing();
+    let (endpoint, conn) = dial(server, verifier.clone(), identity).await?;
+    let server_cert = verifier.seen.lock().unwrap().clone();
+    conn.close(0u32.into(), b"tofu");
+    endpoint.wait_idle().await;
+    server_cert.context("server sent no certificate")
+}
+
 impl Remote {
     pub async fn connect(
         server: &str,

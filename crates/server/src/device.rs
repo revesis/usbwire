@@ -19,6 +19,9 @@ use crate::state::{self, State};
 
 pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// USB CDC data-interface class; its bulk endpoints carry a byte stream.
+const CDC_DATA_CLASS: u8 = 0x0a;
+
 /// An attach refused for a reason the client should see.
 #[derive(Debug, thiserror::Error)]
 #[error("{1}")]
@@ -342,6 +345,9 @@ impl OpenDevice {
 
             // Endpoints of every alt setting; streams are opened per address.
             for alt in intf.alt_settings() {
+                // CDC-ACM data interface (class 0x0A): its bulk endpoints are a
+                // byte stream, so bulk IN may be pushed and bulk OUT early-acked.
+                let stream = alt.class() == CDC_DATA_CLASS;
                 for ep in alt.endpoints() {
                     endpoints.entry(ep.address()).or_insert(EndpointInfo {
                         address: ep.address(),
@@ -354,6 +360,7 @@ impl OpenDevice {
                         },
                         max_packet: ep.max_packet_size() as u16,
                         interval: ep.interval(),
+                        stream,
                     });
                 }
             }
@@ -382,9 +389,14 @@ impl OpenDevice {
         })
     }
 
-    pub fn attach_ok(&self, caps: Capabilities) -> AttachOk {
+    pub fn attach_ok(&self, mut caps: Capabilities) -> AttachOk {
         let mut endpoints: Vec<_> = self.endpoints.values().copied().collect();
         endpoints.sort_by_key(|e| e.address);
+        // Bulk push / early-ack are offered only for CDC-ACM stream endpoints.
+        if !endpoints.iter().any(|e| e.stream) {
+            caps.bulk_in_push = false;
+            caps.bulk_out_ack = false;
+        }
         AttachOk {
             info: self.info.clone(),
             descriptors: self.snapshot.clone(),

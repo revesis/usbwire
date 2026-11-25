@@ -231,7 +231,13 @@ mod tests {
             info: dev(0, 0x0407, Some("123")),
             descriptors: Default::default(),
             endpoints: vec![],
-            caps: Capabilities { interrupt_in_push: true, early_out_ack: true, descriptor_cache: true },
+            caps: Capabilities {
+                interrupt_in_push: true,
+                early_out_ack: true,
+                descriptor_cache: true,
+                bulk_in_push: true,
+                bulk_out_ack: true,
+            },
         };
         // After a server restart ids are reassigned; another key with the same
         // VID:PID but another serial must not be taken for ours.

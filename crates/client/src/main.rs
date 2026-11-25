@@ -51,10 +51,14 @@ struct Args {
     auto_attach: bool,
     /// serve: reconnect when the connection to the server drops.
     reconnect: bool,
+    /// Learn and pin the server cert on first use instead of requiring pairing
+    /// (trusted LAN). The server still gates admission via its trusted subnets.
+    trust_server: bool,
 }
 
 const USAGE: &str = "usage: usbwire-client <pair|list|serve|bench|service install|service uninstall> --server HOST:PORT [--code CODE] [--dev VID:PID] \
-[--listen ADDR] [--attach] [--no-reconnect] [-n N] [--state DIR] [--cert FILE] [--no-early-ack] [--no-push] [--no-desc-cache]";
+[--listen ADDR] [--attach] [--no-reconnect] [--trust-server] [-n N] [--state DIR] [--cert FILE] \
+[--no-early-ack] [--no-push] [--bulk-stream] [--no-desc-cache]";
 
 fn default_state() -> PathBuf {
     if let Ok(d) = std::env::var("USBWIRE_CLIENT_STATE") {
@@ -86,9 +90,19 @@ fn parse_args(raw: Vec<String>) -> Result<Args> {
         dev: None,
         listen: None,
         rounds: 200,
-        caps: Capabilities { interrupt_in_push: true, early_out_ack: true, descriptor_cache: true },
+        caps: Capabilities {
+            interrupt_in_push: true,
+            early_out_ack: true,
+            descriptor_cache: true,
+            // Experimental and off by default: pushing / early-acking bulk breaks
+            // the CDC-ACM request/response framing of real serial devices (tested
+            // with a Proxmark3). Opt in with --bulk-stream. No benefit on a LAN.
+            bulk_in_push: false,
+            bulk_out_ack: false,
+        },
         auto_attach: false,
         reconnect: true,
+        trust_server: false,
     };
     while let Some(arg) = it.next() {
         let mut val = || it.next().with_context(|| format!("{arg} needs a value"));
@@ -101,8 +115,14 @@ fn parse_args(raw: Vec<String>) -> Result<Args> {
             "-n" => a.rounds = val()?.parse()?,
             "--attach" => a.auto_attach = true,
             "--no-reconnect" => a.reconnect = false,
+            "--trust-server" => a.trust_server = true,
             "--no-early-ack" => a.caps.early_out_ack = false,
             "--no-push" => a.caps.interrupt_in_push = false,
+            "--bulk-stream" => {
+                // Experimental: see the caps default above.
+                a.caps.bulk_in_push = true;
+                a.caps.bulk_out_ack = true;
+            }
             "--no-desc-cache" => a.caps.descriptor_cache = false,
             "--dev" => {
                 let v = val()?;
@@ -168,9 +188,26 @@ async fn run(args: Args, stop: watch::Receiver<bool>) -> Result<()> {
     }
 
     let cert_path = args.cert.clone().unwrap_or_else(|| server_cert_path(&args.state, &args.server));
+    // Trust-on-first-use: if we have no pinned server cert yet and --trust-server
+    // was given, learn and pin it now. The server still decides whether to admit
+    // us (trusted-subnet auto-pairing). Useful on a trusted LAN to skip pairing.
+    if args.trust_server && args.cert.is_none() && !cert_path.exists() {
+        // A second copy of our identity (keys aren't Clone); same files on disk.
+        let id2 = usbwire_net::load_or_create_identity(&args.state)?;
+        let cert = remote::fetch_server_cert(&args.server, id2).await?;
+        if let Some(dir) = cert_path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&cert_path, &cert)?;
+        tracing::warn!(
+            "trusted server {} on first use; pinned cert {}",
+            args.server,
+            usbwire_net::auth::short_fp(&usbwire_net::auth::fingerprint(&cert))
+        );
+    }
     let server_cert = std::fs::read(&cert_path)
         .map(usbwire_net::quinn::rustls::pki_types::CertificateDer::from)
-        .with_context(|| format!("not paired with {} (no {}): run `usbwire-client pair` first", args.server, cert_path.display()))?;
+        .with_context(|| format!("not paired with {} (no {}): run `usbwire-client pair`, or pass --trust-server on a trusted LAN", args.server, cert_path.display()))?;
     let target = link::Target { server: args.server.clone(), cert: server_cert, identity, caps: args.caps, want: args.dev };
     match args.cmd.as_str() {
         "serve" => serve(&args, target, stop).await,

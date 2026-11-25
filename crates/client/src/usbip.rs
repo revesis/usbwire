@@ -267,14 +267,34 @@ impl Adapter {
         self.attach.endpoints.iter().find(|e| e.address == ep).map(|e| e.xfer)
     }
 
-    /// Complete interrupt OUT URBs locally instead of waiting a round trip.
-    /// Without it, multi-packet CTAPHID messages time out on the device over WAN.
+    /// CDC-ACM stream endpoint: bulk here may be pushed / early-acked.
+    fn is_stream(&self, ep: u8) -> bool {
+        self.attach.endpoints.iter().find(|e| e.address == ep).is_some_and(|e| e.stream)
+    }
+
+    /// Complete OUT URBs locally instead of waiting a round trip. Without it,
+    /// multi-packet CTAPHID messages time out on the device over WAN; for a
+    /// CDC-ACM serial stream it hides the write latency the same way.
     fn early_ack(&self, ep: u8) -> bool {
-        self.caps.early_out_ack && ep & 0x80 == 0 && ep != 0 && self.xfer(ep) == Some(XferType::Interrupt)
+        if ep & 0x80 != 0 || ep == 0 {
+            return false;
+        }
+        match self.xfer(ep) {
+            Some(XferType::Interrupt) => self.caps.early_out_ack,
+            Some(XferType::Bulk) => self.caps.bulk_out_ack && self.is_stream(ep),
+            _ => false,
+        }
     }
 
     fn is_push(&self, ep: u8) -> bool {
-        self.caps.interrupt_in_push && ep & 0x80 != 0 && self.xfer(ep) == Some(XferType::Interrupt)
+        if ep & 0x80 == 0 {
+            return false;
+        }
+        match self.xfer(ep) {
+            Some(XferType::Interrupt) => self.caps.interrupt_in_push,
+            Some(XferType::Bulk) => self.caps.bulk_in_push && self.is_stream(ep),
+            _ => false,
+        }
     }
 
     /// Answer a standard GET_DESCRIPTOR from the attach-time snapshot.

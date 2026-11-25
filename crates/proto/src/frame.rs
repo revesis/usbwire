@@ -105,8 +105,15 @@ mod tests {
                 xfer: XferType::Interrupt,
                 max_packet: 64,
                 interval: 2,
+                stream: false,
             }],
-            caps: Capabilities { interrupt_in_push: true, early_out_ack: true, descriptor_cache: true },
+            caps: Capabilities {
+                interrupt_in_push: true,
+                early_out_ack: true,
+                descriptor_cache: true,
+                bulk_in_push: true,
+                bulk_out_ack: true,
+            },
         }));
         let mut wire = BytesMut::new();
         encode(&msg, &mut wire).unwrap();
