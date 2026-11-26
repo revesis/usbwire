@@ -9,13 +9,6 @@
 //! Selectors are hex "VID:PID", "VID:*" or "*". Devices offered at all are set
 //! by `export` in <state>/config.json; a client's allow list narrows that.
 
-mod device;
-mod endpoint;
-mod server;
-mod state;
-#[cfg(windows)]
-mod service;
-
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,7 +16,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use usbwire_net::auth;
 
-use crate::state::State;
+use usbwire_server::state::{self, State};
+use usbwire_server::server;
+#[cfg(windows)]
+use usbwire_server::service;
 
 struct Args {
     cmd: Vec<String>,
@@ -31,13 +27,16 @@ struct Args {
     listen: Option<SocketAddr>,
     name: String,
     allow: Vec<String>,
+    /// Export a single device from an already-open usbdevfs fd (Android
+    /// UsbManager / Linux portal) instead of enumerating. See `server::run`.
+    from_fd: Option<i32>,
 }
 
 const USAGE: &str = "usage: usbwire-server [run|pair|clients|revoke WHO|service install|service uninstall] \
-[--state DIR] [--listen ADDR:PORT] [--name NAME] [--allow SEL,...]";
+[--state DIR] [--listen ADDR:PORT] [--name NAME] [--allow SEL,...] [--from-fd N]";
 
 fn parse_args() -> Result<Args> {
-    let mut a = Args { cmd: vec![], state: state::default_dir(), listen: None, name: String::new(), allow: vec![] };
+    let mut a = Args { cmd: vec![], state: state::default_dir(), listen: None, name: String::new(), allow: vec![], from_fd: None };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut val = || it.next().with_context(|| format!("{arg} needs a value"));
@@ -46,6 +45,7 @@ fn parse_args() -> Result<Args> {
             "--listen" => a.listen = Some(val()?.parse()?),
             "--name" => a.name = val()?,
             "--allow" => a.allow = val()?.split(',').map(|s| s.trim().to_string()).collect(),
+            "--from-fd" => a.from_fd = Some(val()?.parse().context("--from-fd needs an integer fd")?),
             "-h" | "--help" => bail!("{USAGE}"),
             s if s.starts_with("--") => bail!("unknown option {s}\n{USAGE}"),
             _ => a.cmd.push(arg),
@@ -70,7 +70,7 @@ fn main() -> Result<()> {
             init_console_logging();
             let state = Arc::new(State::open(&args.state)?);
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(server::run(state, args.listen, async {
+            rt.block_on(server::run(state, args.listen, args.from_fd, async {
                 let _ = tokio::signal::ctrl_c().await;
             }))
         }

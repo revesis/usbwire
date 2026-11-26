@@ -66,7 +66,11 @@ fn device_record(a: &AttachOk, with_interfaces: bool) -> Vec<u8> {
         Speed::High => 3,
         Speed::Super => 5,
         Speed::SuperPlus => 6,
-        Speed::Unknown => 0,
+        // The kernel's vhci `attach` rejects speed 0, and some servers can't
+        // report speed (e.g. Android usbfs: USBDEVFS_GET_SPEED fails). Default
+        // unknown to full-speed, which is correct for CDC-ACM devices like the
+        // Proxmark3 and safe for enumeration.
+        Speed::Unknown => 2,
     };
     out.extend_from_slice(&speed.to_be_bytes());
     out.extend_from_slice(&a.info.vid.to_be_bytes());

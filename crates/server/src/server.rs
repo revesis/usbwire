@@ -38,7 +38,12 @@ impl Drop for SessionGuard<'_> {
 
 /// Serve until `shutdown` resolves, then close connections and give swapped
 /// devices back to their drivers.
-pub async fn run(state: Arc<State>, listen: Option<SocketAddr>, shutdown: impl Future<Output = ()>) -> Result<()> {
+pub async fn run(
+    state: Arc<State>,
+    listen: Option<SocketAddr>,
+    from_fd: Option<i32>,
+    shutdown: impl Future<Output = ()>,
+) -> Result<()> {
     recover_from_journal().await;
     let identity = usbwire_net::load_or_create_identity(&state.dir)?;
     let fingerprint = auth::fingerprint(&identity.0);
@@ -49,7 +54,14 @@ pub async fn run(state: Arc<State>, listen: Option<SocketAddr>, shutdown: impl F
     let endpoint = quinn::Endpoint::server(usbwire_net::server_config(identity)?, addr)?;
     info!(state = %state.dir.display(), fingerprint = auth::short_fp(&fingerprint), "listening on {addr}");
 
-    let srv = Arc::new(Server { registry: Registry::new(state.clone()), state, fingerprint, sessions: Default::default() });
+    let registry = match from_fd {
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        Some(fd) => Registry::from_fd(state.clone(), fd).await?,
+        #[cfg(not(any(target_os = "android", target_os = "linux")))]
+        Some(_) => bail!("--from-fd is only supported on Android and Linux"),
+        None => Registry::new(state.clone()),
+    };
+    let srv = Arc::new(Server { registry, state, fingerprint, sessions: Default::default() });
     // `usbwire-server revoke` edits clients.json from another process; end
     // the revoked client's open sessions here.
     let watcher = {
