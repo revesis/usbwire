@@ -131,7 +131,7 @@ fn run_service(dir: PathBuf) -> Result<()> {
     let state = Arc::new(State::open(&dir)?);
     let rt = tokio::runtime::Runtime::new()?;
     let mut stop = stop_rx;
-    let result = rt.block_on(crate::server::run(state, None, async move {
+    let result = rt.block_on(crate::server::run(state, None, None, async move {
         let _ = stop.wait_for(|s| *s).await;
         // Restoring drivers on the way out can take a few seconds.
         let _ = handle.set_service_status(status(
