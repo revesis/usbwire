@@ -32,7 +32,9 @@ fn refuse(code: ErrorCode, msg: impl Into<String>) -> anyhow::Error {
 }
 
 /// Stable identity of a physical device: survives the driver swap, which
-/// re-enumerates the device under a new handle.
+/// re-enumerates the device under a new handle. Enumeration is not used on
+/// Android (the device arrives as an fd via `--from-fd`).
+#[cfg(not(target_os = "android"))]
 fn device_key(d: &nusb::DeviceInfo) -> String {
     #[cfg(windows)]
     {
@@ -49,6 +51,15 @@ struct Holder {
     conn: quinn::Connection,
 }
 
+/// A single device handed to us as an already-open usbdevfs fd (Android
+/// UsbManager / Linux portal), served without enumeration. Its DevId is fixed
+/// at 0 and its registry key at "fd0".
+struct Pinned {
+    device: nusb::Device,
+    info: DeviceInfo,
+    key: String,
+}
+
 /// Devices, who holds them, and which ones we bound to WinUSB.
 pub struct Registry {
     state: Arc<State>,
@@ -57,6 +68,8 @@ pub struct Registry {
     holders: Mutex<HashMap<String, Holder>>,
     /// Devices we swapped to WinUSB: key -> (instance id, release generation).
     swapped: Mutex<HashMap<String, (String, u64)>>,
+    /// Set in `--from-fd` mode: the one device we export, already open.
+    pinned: Option<Pinned>,
 }
 
 impl Registry {
@@ -66,7 +79,51 @@ impl Registry {
             keys: Default::default(),
             holders: Default::default(),
             swapped: Default::default(),
+            pinned: None,
         })
+    }
+
+    /// `--from-fd` mode: adopt an already-open usbdevfs fd and export just that
+    /// device. nusb reads descriptors straight from the fd (no sysfs, no root),
+    /// which is exactly what Android's `UsbDeviceConnection.getFileDescriptor()`
+    /// hands us after the user grants USB permission.
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    pub async fn from_fd(state: Arc<State>, raw: i32) -> Result<Arc<Self>> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+        let device =
+            nusb::Device::from_fd(owned).await.context("opening USB device from the provided fd")?;
+        let dd = device.device_descriptor();
+        let info = DeviceInfo {
+            dev: 0,
+            vid: dd.vendor_id(),
+            pid: dd.product_id(),
+            bcd_device: dd.device_version(),
+            class: dd.class(),
+            speed: match device.speed() {
+                Some(nusb::Speed::Low) => Speed::Low,
+                Some(nusb::Speed::Full) => Speed::Full,
+                Some(nusb::Speed::High) => Speed::High,
+                Some(nusb::Speed::Super) => Speed::Super,
+                Some(nusb::Speed::SuperPlus) => Speed::SuperPlus,
+                _ => Speed::Unknown,
+            },
+            manufacturer: None,
+            product: None,
+            serial: None,
+            busy: false,
+        };
+        info!(
+            "from-fd: exporting {:04x}:{:04x} (class {:02x}) from fd {raw}",
+            info.vid, info.pid, info.class
+        );
+        Ok(Arc::new(Registry {
+            state,
+            keys: Mutex::new(vec!["fd0".to_string()]),
+            holders: Default::default(),
+            swapped: Default::default(),
+            pinned: Some(Pinned { device, info, key: "fd0".to_string() }),
+        }))
     }
 
     fn id_for(&self, key: &str) -> DevId {
@@ -81,6 +138,7 @@ impl Registry {
     }
 
     /// Devices the server offers (config `export`) that this client may use.
+    #[cfg(not(target_os = "android"))]
     fn offered(&self, d: &nusb::DeviceInfo, allow: &[String]) -> Result<bool> {
         let cfg = self.state.config()?;
         Ok(d.class() != 0x09
@@ -89,20 +147,45 @@ impl Registry {
             && state::any_matches(allow, d.vendor_id(), d.product_id()))
     }
 
-    pub fn list(&self, allow: &[String]) -> Result<Vec<DeviceInfo>> {
-        let holders = self.holders.lock().unwrap();
-        let mut out = Vec::new();
-        for d in nusb::list_devices().wait()? {
-            if self.offered(&d, allow)? {
-                let key = device_key(&d);
-                let mut info = device_info(self.id_for(&key), &d);
-                info.busy = holders.contains_key(&key);
-                out.push(info);
-            }
-        }
-        Ok(out)
+    /// Whether the pinned device's vid/pid is both exported by the server and
+    /// allowed for this client. Same policy as `offered`, minus enumeration.
+    fn pinned_offered(&self, info: &DeviceInfo, allow: &[String]) -> Result<bool> {
+        let cfg = self.state.config()?;
+        Ok(state::any_matches(&cfg.export, info.vid, info.pid)
+            && state::any_matches(allow, info.vid, info.pid))
     }
 
+    pub fn list(&self, allow: &[String]) -> Result<Vec<DeviceInfo>> {
+        if let Some(p) = &self.pinned {
+            if !self.pinned_offered(&p.info, allow)? {
+                return Ok(Vec::new());
+            }
+            let mut info = p.info.clone();
+            info.busy = self.holders.lock().unwrap().contains_key(&p.key);
+            return Ok(vec![info]);
+        }
+        #[cfg(target_os = "android")]
+        {
+            let _ = allow;
+            return Ok(Vec::new());
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let holders = self.holders.lock().unwrap();
+            let mut out = Vec::new();
+            for d in nusb::list_devices().wait()? {
+                if self.offered(&d, allow)? {
+                    let key = device_key(&d);
+                    let mut info = device_info(self.id_for(&key), &d);
+                    info.busy = holders.contains_key(&key);
+                    out.push(info);
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
     fn find(&self, key: &str) -> Result<Option<nusb::DeviceInfo>> {
         Ok(nusb::list_devices().wait()?.find(|d| device_key(d) == key))
     }
@@ -141,18 +224,39 @@ impl Registry {
         client: &state::Client,
         conn: &quinn::Connection,
     ) -> Result<OpenDevice> {
-        let key = self.keys.lock().unwrap().get(dev as usize).cloned();
-        let key = key.ok_or_else(|| refuse(ErrorCode::NoSuchDevice, "unknown device id (list devices first)"))?;
-        let info = self.find(&key)?.ok_or_else(|| refuse(ErrorCode::NoSuchDevice, "device is no longer present"))?;
-        if !self.offered(&info, &client.allow)? {
-            return Err(refuse(ErrorCode::Unauthorized, "this client is not allowed to use the device"));
+        if let Some(p) = &self.pinned {
+            if dev != 0 {
+                return Err(refuse(ErrorCode::NoSuchDevice, "unknown device id (list devices first)"));
+            }
+            if !self.pinned_offered(&p.info, &client.allow)? {
+                return Err(refuse(ErrorCode::Unauthorized, "this client is not allowed to use the device"));
+            }
+            let lease = self.acquire(&p.key, &client.fingerprint, conn).await?;
+            // Device is Arc-backed; the clone shares the same open fd and lets a
+            // reconnecting client re-claim interfaces the previous lease dropped.
+            let open = OpenDevice::from_open_device(dev, p.device.clone(), p.info.clone(), lease).await?;
+            return Ok(open);
         }
-        let lease = self.acquire(&key, &client.fingerprint, conn).await?;
+        #[cfg(target_os = "android")]
+        {
+            let _ = (dev, client, conn);
+            Err(refuse(ErrorCode::NoSuchDevice, "no device (server was started without --from-fd)"))
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let key = self.keys.lock().unwrap().get(dev as usize).cloned();
+            let key = key.ok_or_else(|| refuse(ErrorCode::NoSuchDevice, "unknown device id (list devices first)"))?;
+            let info = self.find(&key)?.ok_or_else(|| refuse(ErrorCode::NoSuchDevice, "device is no longer present"))?;
+            if !self.offered(&info, &client.allow)? {
+                return Err(refuse(ErrorCode::Unauthorized, "this client is not allowed to use the device"));
+            }
+            let lease = self.acquire(&key, &client.fingerprint, conn).await?;
 
-        #[cfg(windows)]
-        let info = self.ensure_winusb(&key, info).await?;
-        let open = OpenDevice::open(dev, &info, lease).await?;
-        Ok(open)
+            #[cfg(windows)]
+            let info = self.ensure_winusb(&key, info).await?;
+            let open = OpenDevice::open(dev, &info, lease).await?;
+            Ok(open)
+        }
     }
 
     /// Windows: bind the device to WinUSB if it isn't yet, and wait for it to
@@ -274,6 +378,7 @@ impl Drop for Lease {
 
 /// A device that is itself attached over USB/IP (usbip-win2 on this machine).
 /// Exporting it would loop it back through the server.
+#[cfg(not(target_os = "android"))]
 fn is_remote(d: &nusb::DeviceInfo) -> bool {
     #[cfg(windows)]
     {
@@ -290,6 +395,7 @@ fn is_remote(d: &nusb::DeviceInfo) -> bool {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn device_info(dev: DevId, d: &nusb::DeviceInfo) -> DeviceInfo {
     DeviceInfo {
         dev,
@@ -328,8 +434,21 @@ pub struct OpenDevice {
 }
 
 impl OpenDevice {
+    #[cfg(not(target_os = "android"))]
     async fn open(dev: DevId, d: &nusb::DeviceInfo, lease: Lease) -> Result<Self> {
         let device = d.open().await?;
+        Self::from_open_device(dev, device, device_info(dev, d), lease).await
+    }
+
+    /// Build from an already-open device. The enumeration path opens via a
+    /// `DeviceInfo`; the `--from-fd` path passes a device opened from an
+    /// external usbdevfs fd. `info` is its descriptor-derived wire identity.
+    async fn from_open_device(
+        dev: DevId,
+        device: nusb::Device,
+        info: DeviceInfo,
+        lease: Lease,
+    ) -> Result<Self> {
         let cfg = device.active_configuration()?;
         let config_value = cfg.configuration_value();
 
@@ -370,15 +489,15 @@ impl OpenDevice {
         info!(
             dev,
             "opened {:04x}:{:04x}: {} interfaces, {} endpoints, snapshot {} strings, {} HID reports",
-            d.vendor_id(),
-            d.product_id(),
+            info.vid,
+            info.pid,
             interfaces.len(),
             endpoints.len(),
             snapshot.strings.len(),
             snapshot.hid_reports.len()
         );
         Ok(OpenDevice {
-            info: device_info(dev, d),
+            info,
             _device: device,
             interfaces,
             endpoints,
